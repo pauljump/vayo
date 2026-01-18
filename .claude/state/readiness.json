@@ -1,0 +1,14 @@
+{
+  "ideaId": "IDEA-161",
+  "currentReadiness": 0,
+  "lastUpdated": "2026-01-18T22:30:00Z",
+  "breakdown": {
+    "coreValueClarity": 0,
+    "mvpScope": 0,
+    "technicalApproach": 0,
+    "assumptionsValidated": 0,
+    "blockersResolved": 0
+  },
+  "status": "exploring",
+  "nextSteps": "Start questioning protocol to define data pipeline"
+}
