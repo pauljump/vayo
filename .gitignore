@@ -1,0 +1,19 @@
+# Data files (too large for git)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+nycdb_data/
+stuy-scrape-csv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+venv/
