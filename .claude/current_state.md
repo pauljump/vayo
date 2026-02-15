@@ -1,88 +1,86 @@
 # vayo - Current State
 
 **Last updated:** 2026-02-14
-**Sessions:** ~5+
-**Readiness:** 25%
+**Sessions:** ~6+
+**Readiness:** 35%
 
 ## Goal
-Build a comprehensive dataset of all NYC residential buildings and units for rental intelligence.
+Build a "Zillow meets Bloomberg Terminal" apartment finder that uses public data transparency to surface hidden gems and predict availability before listings go live.
 
 ## Status
-Data collection & assembly — building the `all_nyc_units.db` dataset.
+Data consolidation complete. Clean database built. Scoring prototype exists. Ready to iterate on the product.
 
 ## What We Have
 
-### Database: `all_nyc_units.db` (785 MB)
-- **3,893,293 total units** across **767,302 buildings** (100% of PLUTO residential buildings)
-- **912,653 real discovered units** (23.4%) from ACRIS, HPD, text mining
-- **2,980,640 placeholder units** inferred from PLUTO unit counts
-- Every building has: BBL, borough, address, zipcode, building class, year built, floors
+### Database: `vayo_clean.db` (8.4 GB) — THE canonical database
+All tables keyed on BBL integer with proper indexes. 14 tables, ~49M records.
 
-### Sources Integrated
-| Source | Units | Notes |
-|--------|-------|-------|
-| ACRIS (deeds) | 459,184 | Highest quality, real unit IDs, condo/coop classification |
-| Text Mining (DOB/ECB/311) | 453,169 | Extracted from complaint/violation text |
-| HPD | 300 | Only BIN-BBL matched ones; see "unfinished" below |
-| PLUTO Inferred | 2,980,640 | Placeholder units based on building unit counts |
+| Table | Rows | Notes |
+|-------|------|-------|
+| buildings | 767,302 | All NYC residential from PLUTO (foundation) |
+| acris_transactions | 1,222,855 | Proper BBL + condo mapping + buyer/seller names |
+| complaints | 25,038,632 | HPD complaints via BIN→BBL |
+| service_requests_311 | 15,132,059 | Detailed 311 with resolution + lat/lon |
+| complaints_311 | 3,299,201 | Compact 311 (from nyc_311_complete) |
+| ecb_violations | 836,477 | ECB violations via BIN→BBL |
+| building_contacts | 713,578 | Managing agents, owners, officers |
+| hpd_litigation | 204,005 | HPD litigation cases |
+| dob_permits | 950,978 | DOB permits via boro+block+lot |
+| dob_complaints | 1,438,476 | DOB complaints via BIN→BBL |
+| marshal_evictions | 38,979 | Address-matched to PLUTO BBLs |
+| rent_stabilized | 40,132 | With 421-a/J-51 flags |
+| certificates_of_occupancy | 88,437 | Legal occupancy changes |
+| bin_map | 194,209 | BIN→BBL cross-reference |
 
-### Coverage by Borough
-| Borough | Total | Real | Real % |
-|---------|-------|------|--------|
-| Manhattan | 1,010,061 | 331,721 | 32.8% |
-| Brooklyn | 1,162,430 | 269,663 | 23.2% |
-| Queens | 945,849 | 191,732 | 20.3% |
-| Bronx | 590,283 | 97,111 | 16.5% |
-| Staten Island | 184,670 | 22,426 | 12.1% |
+### Database: `all_nyc_units.db` (785 MB) — unit-level dataset
+- 3,893,293 total units across 767,302 buildings
+- 912,653 real discovered units (23.4%), 2,980,640 placeholders
+- Still needs BIN-only HPD units added (see unfinished work below)
 
-### Big Source DB: `stuy-scrape-csv/stuytown.db` (38 GB)
-Contains all raw data: ACRIS, HPD, PLUTO, DOB, ECB, 311, rent stabilization, etc.
-- `canonical_units`: 3.29M units (the full discovered set before PLUTO matching)
-- `buildings`: 571K buildings
-- Plus 20+ other tables (complaints, violations, permits, listings, etc.)
+### Apartment Finder Prototype
+- `scripts/apartment_finder.py` — Scores buildings on two axes:
+  - **Gem Score (0-100):** Size, maintenance, noise, character, rent stabilization
+  - **Availability Score (0-100):** ACRIS turnover, estate/trust signals, lis pendens, mortgage satisfactions
+- Tested on Gramercy area: 7,243 buildings scored, 117 "diamonds" found
+- Currently reads from OLD big DB — needs update to use `vayo_clean.db`
 
-## Unfinished Work (Resume Here)
+### Key Insight
+Buildings like 18 Gramercy Park South, 12 East 13th, 31 West 21st show active ACRIS trading (LLCs, trusts, estate transfers) but never appear on StreetEasy. Public data reveals a parallel market.
 
-### 1. BIN-to-BBL Matching (~1.9M more real units)
-**This is the biggest win.** We have:
-- **1,384,650 HPD units** identified by BIN only (no BBL)
-- **513,066 text-mined units** with non-standard BBLs (e.g., `BROOKLYN0232100008`)
-- CSV exports already created at:
-  - `nycdb_data/hpd_units.csv` (1.38M rows)
-  - `nycdb_data/text_units_nomatch.csv` (861K rows)
-  - `nycdb_data/bin_to_bbl.csv` (225K BIN→BBL mappings)
-- Script ready: `scripts/add_missing_units.py` — reads CSVs, maps to PLUTO, inserts into `all_nyc_units.db`
-- **Problem:** Python process stalled when reading from 38GB DB. CSVs are now exported, so next run should work against the small DB only.
-- **Expected result:** Real coverage should jump from 23% → ~55%+
+## Deleted
+- `stuy-scrape-csv/stuytown.db` (38 GB) — deleted 2026-02-14. All unique data consolidated into `vayo_clean.db`.
 
-### 2. Text BBL Normalization
-- Text-mined BBLs like `BROOKLYN0232100008` need converting to 10-digit numeric (`3023210008`)
-- The `normalize_text_bbl()` function in `add_missing_units.py` handles this
-- Part of the same script above
+## Unfinished Work
 
-### 3. BIN Fill (Skipped)
-- Attempted to UPDATE 3.3M rows in the 38GB DB to fill missing BINs
-- Ran for 51+ minutes at 100% CPU, was killed
-- Not critical — BBL is the primary key for PLUTO matching
+### 1. Update `apartment_finder.py` to use `vayo_clean.db`
+- Currently queries the old 38GB DB (now deleted)
+- Should be much simpler since all tables now have BBL keys
+- No more BIN→BBL joins needed at query time
 
-## Key Technical Decisions
-- **PLUTO-anchored approach:** Start from PLUTO (ground truth for all NYC buildings), match discovered units to it, fill gaps with placeholders
-- **Condo lot mapping:** ACRIS uses per-unit lot numbers (1001-7499); mapped back to building BBLs via boro+block matching (302K units recovered)
-- **Separate small DB:** Operations on the 38GB `stuytown.db` are painfully slow; built `all_nyc_units.db` (785MB) for the final dataset
-- **Python over SQL:** SQLite cross-joins for placeholder generation too slow; Python generates in-memory and batch-inserts (26 seconds vs hours)
+### 2. BIN-to-BBL Matching for `all_nyc_units.db` (~1.9M more real units)
+- CSV exports ready at `nycdb_data/hpd_units.csv`, `nycdb_data/text_units_nomatch.csv`, `nycdb_data/bin_to_bbl.csv`
+- Script: `scripts/add_missing_units.py`
+- Would push real unit coverage from 23% → ~55%+
+
+### 3. Product Development
+- Web UI for apartment finder
+- More scoring dimensions (energy efficiency, permit activity, eviction history)
+- Alert system for ACRIS activity on target buildings
+- Neighborhood-level aggregation
 
 ## Key Files
-- `all_nyc_units.db` — The output dataset (785 MB)
-- `stuy-scrape-csv/stuytown.db` — Raw source data (38 GB)
-- `scripts/build_complete_db.py` — Builds all_nyc_units.db from scratch
-- `scripts/add_missing_units.py` — Adds BIN-only & text-BBL units (RESUME THIS)
-- `scripts/07_complete_coverage.sql` — SQL version (too slow, use Python instead)
-- `scripts/06_calculate_real_coverage.sql` — Coverage stats against PLUTO
-- `nycdb_data/hpd_units.csv` — Exported HPD BIN-only units
-- `nycdb_data/text_units_nomatch.csv` — Exported text-mined unmatched units
-- `nycdb_data/bin_to_bbl.csv` — BIN→BBL mapping from buildings table
+- `vayo_clean.db` — Consolidated clean database (8.4 GB)
+- `all_nyc_units.db` — Unit-level dataset (785 MB)
+- `scripts/build_clean_db.py` — Builds vayo_clean.db from scratch
+- `scripts/fix_remaining.py` — Fixes DOB complaints/permits, marshal evictions
+- `scripts/pull_remaining.py` — Pulls rent stab, detailed 311, certificates of occupancy
+- `scripts/apartment_finder.py` — Scoring engine prototype (needs update)
+- `scripts/diagnose_formats.sql` — BBL format diagnosis
+- `gramercy_gems.json` — Scored results for Gramercy area
 
-## Next Actions
-1. **Run `scripts/add_missing_units.py`** — should work now with CSV exports (no 38GB reads)
-2. Verify coverage jumps to ~55%+
-3. Consider additional data sources for remaining gaps (mostly 1-5 unit buildings)
+## Key Technical Decisions
+- **PLUTO-anchored:** All data matched to PLUTO's 767K residential buildings via integer BBL
+- **BIN→BBL bridge table:** `bin_map` enables joining HPD/DOB/ECB data that only has BIN
+- **Condo lot mapping:** ACRIS per-unit lots (1001-7499) mapped back to building BBL via boro+block
+- **DOB lot fix:** DOB uses 5-digit lots, PLUTO uses 4-digit — use `lot[-4:]`
+- **Python over SQL:** Batch processing in Python (26s) vs SQLite cross-joins (hours)
