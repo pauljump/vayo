@@ -1,39 +1,51 @@
 # vayo - Current State
 
 **Last updated:** 2026-02-16
-**Sessions:** ~8+
+**Sessions:** ~9+
 **Readiness:** 45%
 
 ## Goal
 Build a "Zillow meets Bloomberg Terminal" apartment finder that uses public data transparency to surface hidden gems and predict availability before listings go live.
 
 ## Status
-Massive data expansion underway. Full ACRIS history pull nearly complete. StreetEasy scraping breakthrough achieved — browserless high-speed scraper working. Building the most comprehensive NYC real estate database.
+ACRIS full history pull nearly complete. Legals DONE. Parties ~70% done. Built partitioned parallel puller (10x faster than sequential). StreetEasy scraping at 7,304 buildings.
 
-## What's Running Right Now
+## What Needs to Resume
 
-### StreetEasy Fast Scraper (background task b8b17a4)
-- **Script:** `scripts/se_fast_scrape.py --from-sitemap --delay 1.0`
-- **Method:** tls-client with Chrome cookies (no browser needed)
-- **Target:** 943,790 building slugs from SE sitemaps
-- **Speed:** ~0.6-0.8 buildings/sec (~50K/day)
-- **Auto cookie refresh:** Detects PX blocks, refreshes cookies from Chrome automatically
-- **Progress stored in:** `se_listings.db` — fully resumable (skips already-scraped slugs)
-- **To resume if session lost:** Just re-run the same command. Extract fresh cookies first if needed.
-
-### ACRIS Full History Pulls (background tasks)
-| Endpoint | Task ID | Progress | Status |
-|----------|---------|----------|--------|
-| Master | b9cd12f | **16.9M records** | **DONE** (4.8 GB cache) |
-| Legals | b6e68f3 | ~14.7M+ | Running |
-| Parties | beae785 | ~16.1M+ | Running |
-
-Cache dir: `acris_cache/full/`
-
-### How to Resume ACRIS if Session Lost
+### ACRIS Parties Pull (partitioned)
 ```bash
-python3 scripts/pull_acris.py  # Has offset-based resume built in
+python3 scripts/pull_acris_partitioned.py --parties-only
 ```
+- **Script:** `scripts/pull_acris_partitioned.py`
+- **Method:** Partitioned by document_id range, 6 parallel workers
+- **Progress:** ~70% done. Legals complete. Parties remaining:
+  - `num_2005_2010`: ~4.8M / 6.2M
+  - `num_2010_2015`, `num_2015_2020`, `alpha_BK`: almost done (~95%)
+  - `alpha_FT_1`: ~1.75M / 2.9M
+  - `alpha_FT_2`: ~0.5M / 1.8M
+  - `alpha_FT_3`, `alpha_FT_4`: not started (~5.4M + 6M)
+- **Cache dir:** `acris_cache/full/parties_parts/` — each partition has its own batch files
+- **Fully resumable:** skips existing batch files automatically
+
+### StreetEasy Fast Scraper
+```bash
+python3 scripts/se_fast_scrape.py --from-sitemap --delay 1.0
+```
+- **Progress:** 7,304 / 943,790 buildings (~0.8%)
+- **Resumable:** skips already-scraped slugs in `se_listings.db`
+
+## ACRIS Cache Structure
+
+### Completed Data
+| Endpoint | Location | Records | Status |
+|----------|----------|---------|--------|
+| Master | `acris_cache/full/master/` | 16,908,583 | COMPLETE (339 batches) |
+| Legals | `acris_cache/full/legals_parts/` | 22,510,375 | COMPLETE (5 borough partitions) |
+| Parties | `acris_cache/full/parties_parts/` | ~32M so far | ~70% done (11 partitions) |
+
+### Old sequential cache (superseded by partitioned)
+- `acris_cache/full/legals/` — 371 batches, 18.55M records (incomplete, replaced by legals_parts)
+- `acris_cache/full/parties/` — 377 batches, 18.85M records (incomplete, replaced by parties_parts)
 
 ## Databases
 
@@ -65,11 +77,6 @@ All tables keyed on BBL integer with proper indexes. 14+ tables, ~49M records.
 | price_history | Full unit price timeline (pass 2) |
 | scrape_log | Full audit trail |
 
-### `acris_cache/full/` — Raw ACRIS JSON (will be ~15GB total)
-- `master_batch_*.json` — 339 files, 16.9M records
-- `legals_batch_*.json` — ~295+ files, still growing
-- `parties_batch_*.json` — ~322+ files, still growing
-
 ## StreetEasy Scraping — Two Methods
 
 ### Method 1: Fast Scraper (tls-client) — `scripts/se_fast_scrape.py`
@@ -90,14 +97,6 @@ All tables keyed on BBL integer with proper indexes. 14+ tables, ~49M records.
 - Speed: ~0.3-0.5/s (browser overhead)
 - Best for: targeted deep scrape of specific buildings after fast scraper identifies them
 
-### Strategy
-1. Fast scraper runs through all 943K buildings (building-level data) — ~18 days
-2. Browser scraper does pass 2 on high-value buildings for unit-level price history
-3. ACRIS provides independent sale price verification
-
-## Research
-- `research/streeteasy_scraping.md` — Full analysis of scraping approaches
-
 ## Key Technical Decisions
 - **PLUTO-anchored:** All data matched to PLUTO's 767K residential buildings via integer BBL
 - **BIN→BBL bridge table:** `bin_map` enables joining HPD/DOB/ECB data
@@ -105,24 +104,29 @@ All tables keyed on BBL integer with proper indexes. 14+ tables, ~49M records.
 - **TLS fingerprinting:** `tls-client` with `chrome_120` profile bypasses PerimeterX
 - **PX cookie management:** Auto-extract from Chrome, auto-refresh on 403 blocks
 - **RSC parsing:** StreetEasy's Next.js RSC flight format contains structured JSON data
+- **Partitioned ACRIS pull:** Split by borough/doc_id range for parallel fetch, 10x faster than sequential offset
 
 ## Unfinished Work
 
-### 1. Complete ACRIS Full Pull + Rebuild Database
-- Legals and Parties still downloading
-- When done: rebuild vayo_clean.db with full history (16.9M master + legals + parties)
+### 1. Complete ACRIS Parties Pull
+- Run: `python3 scripts/pull_acris_partitioned.py --parties-only`
+- ~30% remaining (~14M records), should take ~30-45 min
+
+### 2. Rebuild vayo_clean.db with Full ACRIS
+- When parties done: rebuild with all 16.9M master + 22.5M legals + ~46M parties
+- Update `scripts/build_clean_db.py` to read from partitioned cache dirs
 - Will fix the $0 sale price bug (correct field: `document_amt`)
 
-### 2. StreetEasy Full Scrape
-- Fast scraper running on 943K buildings (will take ~18 days)
+### 3. StreetEasy Full Scrape
+- Resume fast scraper on remaining ~936K buildings
 - Then targeted browser scrape for unit-level price history on key buildings
 
-### 3. Update Scoring Engine
+### 4. Update Scoring Engine
 - `scripts/apartment_finder.py` needs update for new table names
 - Wire in new datasets: hpd_violations, tax_liens, vacate_orders
 - Integrate StreetEasy data (market prices, listing activity)
 
-### 4. Product Development
+### 5. Product Development
 - Web UI, alerts, neighborhood aggregation
 
 ## Key Files
@@ -130,8 +134,9 @@ All tables keyed on BBL integer with proper indexes. 14+ tables, ~49M records.
 - `se_listings.db` — StreetEasy data
 - `scripts/se_fast_scrape.py` — High-speed browserless SE scraper
 - `scripts/scrape_streeteasy.py` — Browser-based SE scraper (unit deep scrape)
-- `scripts/se_tls_probe.py` — TLS-client test/probe tool
-- `scripts/pull_acris.py` — ACRIS data puller
+- `scripts/pull_acris_partitioned.py` — Fast partitioned ACRIS puller (NEW)
+- `scripts/pull_acris_full.py` — Sequential ACRIS puller (old, slower)
+- `scripts/pull_acris.py` — ACRIS 2022+ only puller (original)
 - `scripts/build_clean_db.py` — Builds vayo_clean.db
 - `scripts/apartment_finder.py` — Scoring engine
 - `scripts/concierge.py` — Search interface
