@@ -457,6 +457,11 @@ def build_queue(db_path: Path) -> None:
         conn.commit()
         print(f"  Inserted {cur.rowcount:,} new URLs into wb_queue")
 
+    # Also queue any previously discovered units from building pages
+    disc = queue_discovered_units(db_path)
+    if disc > 0:
+        print(f"  Queued {disc:,} discovered unit URLs from building pages")
+
     conn.close()
 
 
@@ -977,6 +982,52 @@ async def run_fetch(
     print(f"  History rows: {stats['history_rows']:,}")
     print(f"  Errors: {stats['errors']:,}")
 
+    # Auto-queue discovered units so they get fetched on the next run
+    queued = queue_discovered_units(db_path)
+    if queued > 0:
+        print(f"\n  Auto-queued {queued:,} newly discovered unit URLs")
+        pending = sqlite3.connect(db_path).execute(
+            "SELECT COUNT(*) FROM wb_queue WHERE status='pending'"
+        ).fetchone()[0]
+        print(f"  Total pending now: {pending:,} — run fetch again to continue")
+
+
+def queue_discovered_units(db_path: Path) -> int:
+    """Queue discovered unit URLs from building pages into wb_queue.
+
+    Building page snapshots contain links to individual rental/sale unit pages.
+    This inserts any discovered URLs not already in the queue, using a synthetic
+    timestamp (latest snapshot of the building they were found in, or fallback).
+    """
+    conn = sqlite3.connect(db_path)
+    ensure_tables(conn)
+
+    # Find discovered unit URLs not yet in the queue
+    cur = conn.execute("""
+        INSERT OR IGNORE INTO wb_queue (url, url_type, se_id, latest_timestamp)
+        SELECT DISTINCT
+            d.unit_url,
+            CASE
+                WHEN d.unit_url LIKE '%/rental/%' THEN 'rental'
+                WHEN d.unit_url LIKE '%/sale/%' THEN 'sale'
+                ELSE 'unknown'
+            END,
+            -- Extract numeric SE id from URL
+            REPLACE(REPLACE(
+                SUBSTR(d.unit_url, INSTR(d.unit_url, '/rental/') + 8),
+                '/sale/', ''), '/rental/', ''),
+            -- Use the building's latest_timestamp as a proxy
+            COALESCE(q.latest_timestamp, '20240101000000')
+        FROM wb_discovered_units d
+        LEFT JOIN wb_queue q ON d.building_url = q.url
+        WHERE d.unit_url NOT IN (SELECT url FROM wb_queue)
+          AND (d.unit_url LIKE '%/rental/%' OR d.unit_url LIKE '%/sale/%')
+    """)
+    inserted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return inserted
+
 
 # ════════════════════════════════════════════════════════════════════
 #  Status / Retry / Export
@@ -1118,10 +1169,11 @@ def main() -> None:
         epilog="""
 Commands:
   index     Download CDX index from Wayback Machine (~45 min)
-  queue     Build work queue from CDX index (seconds)
-  fetch     Fetch and extract data from archived pages (resumable)
+  queue     Build work queue from CDX index + discovered units (seconds)
+  fetch     Fetch and extract data from archived pages (resumable, auto-queues discovered units when done)
   status    Show pipeline progress
   retry     Reset errored items for retry
+  discover  Manually queue discovered unit URLs from building pages
   export    Export price history to CSV
         """,
     )
@@ -1158,6 +1210,10 @@ Commands:
     e_parser.add_argument("--db", default=str(DB_PATH), help=f"SQLite DB path (default: {DB_PATH})")
     e_parser.add_argument("--output", "-o", default="streeteasy_prices.csv", help="Output CSV path")
 
+    # discover
+    d_parser = subparsers.add_parser("discover", help="Queue discovered unit URLs from building pages")
+    d_parser.add_argument("--db", default=str(DB_PATH), help=f"SQLite DB path (default: {DB_PATH})")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1187,6 +1243,10 @@ Commands:
 
     elif args.command == "export":
         export_data(Path(args.db), args.output)
+
+    elif args.command == "discover":
+        queued = queue_discovered_units(Path(args.db))
+        print(f"Queued {queued:,} discovered unit URLs from building pages")
 
 
 if __name__ == "__main__":
