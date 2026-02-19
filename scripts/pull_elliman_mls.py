@@ -28,6 +28,8 @@ import re
 import sqlite3
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,14 +43,31 @@ DB_PATH = Path(__file__).parent.parent / "elliman_mls.db"
 MAX_RETRIES = 6
 BATCH_SIZE = 100
 MAX_SKIP = 4999
-DELAY = 0.4  # seconds between requests
+DELAY = 0.15  # seconds between requests (was 0.4)
 HIT_LIMIT = 4900  # if we get this many, assume there's more beyond 5K
+NUM_WORKERS = 4  # concurrent neighborhood workers
 
 API_BASE = "https://core.api.elliman.com"
+
+# Rate limiter — ensures minimum gap between any two API calls across all threads
+_rate_lock = threading.Lock()
+_last_request_time = 0.0
+MIN_GAP = 0.1  # minimum seconds between any two requests globally
 
 
 def tprint(msg):
     print(msg, flush=True)
+
+
+def _rate_wait():
+    """Enforce minimum gap between API calls across all threads."""
+    global _last_request_time
+    with _rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_request_time
+        if elapsed < MIN_GAP:
+            time.sleep(MIN_GAP - elapsed)
+        _last_request_time = time.monotonic()
 
 
 # ── Auth ────────────────────────────────────────────────────
@@ -69,6 +88,8 @@ def make_headers():
 
 def init_db():
     conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS listings (
             core_listing_id TEXT PRIMARY KEY,
@@ -149,11 +170,20 @@ def init_db():
     return conn
 
 
+def thread_conn():
+    """Create a new DB connection for use in a worker thread."""
+    c = sqlite3.connect(str(DB_PATH))
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+
+
 # ── API ─────────────────────────────────────────────────────
 
 def api_post(endpoint, payload, label=""):
     url = f"{API_BASE}{endpoint}"
     for attempt in range(MAX_RETRIES):
+        _rate_wait()
         try:
             resp = requests.post(url, headers=make_headers(), json=payload, timeout=30)
             if resp.status_code == 200:
@@ -174,6 +204,7 @@ def api_post(endpoint, payload, label=""):
 def api_get(endpoint, params=None, label=""):
     url = f"{API_BASE}{endpoint}"
     for attempt in range(MAX_RETRIES):
+        _rate_wait()
         try:
             resp = requests.get(url, headers=make_headers(), params=params, timeout=30)
             if resp.status_code == 200:
@@ -205,14 +236,17 @@ MANHATTAN_HOODS = [
     {"name": "Midtown East", "id": 153804, "urlKey": "midtown-east-new-york-ny"},
     {"name": "Midtown West", "id": 322685, "urlKey": "midtown-west-new-york-ny"},
     {"name": "Chelsea", "id": 153783, "urlKey": "chelsea-new-york-ny"},
+    # Priority neighborhoods
+    {"name": "Gramercy", "id": 153791, "urlKey": "gramercy-new-york-ny"},
     {"name": "Greenwich Village", "id": 153793, "urlKey": "greenwich-village-new-york-ny"},
     {"name": "West Village", "id": 153823, "urlKey": "west-village-new-york-ny"},
     {"name": "East Village", "id": 153787, "urlKey": "east-village-new-york-ny"},
+    {"name": "Stuyvesant Town", "id": 153815, "urlKey": "stuyvesant-town-new-york-ny"},
+    {"name": "Flatiron", "id": 153790, "urlKey": "flatiron-new-york-ny"},
+    # Remaining
     {"name": "SoHo", "id": 153813, "urlKey": "soho-new-york-ny"},
     {"name": "TriBeCa", "id": 153818, "urlKey": "tribeca-new-york-ny"},
-    {"name": "Gramercy", "id": 153791, "urlKey": "gramercy-new-york-ny"},
     {"name": "Murray Hill", "id": 153806, "urlKey": "murray-hill-new-york-ny"},
-    {"name": "Flatiron", "id": 153790, "urlKey": "flatiron-new-york-ny"},
     {"name": "Kips Bay", "id": 153799, "urlKey": "kips-bay-new-york-ny"},
     {"name": "Financial District", "id": 153789, "urlKey": "financial-district-new-york-ny"},
     {"name": "Battery Park City", "id": 153779, "urlKey": "battery-park-city-new-york-ny"},
@@ -228,14 +262,13 @@ MANHATTAN_HOODS = [
     {"name": "Yorkville", "id": 153824, "urlKey": "yorkville-new-york-ny"},
     {"name": "Turtle Bay", "id": 153819, "urlKey": "turtle-bay-new-york-ny"},
     {"name": "Alphabet City", "id": 153778, "urlKey": "alphabet-city-new-york-ny"},
-    {"name": "Stuyvesant Town", "id": 153815, "urlKey": "stuyvesant-town-new-york-ny"},
     {"name": "Little Italy", "id": 153800, "urlKey": "little-italy-new-york-ny"},
     {"name": "Chinatown", "id": 153784, "urlKey": "chinatown-new-york-ny"},
 ]
 
 BROOKLYN_HOODS = [
-    {"name": "Williamsburg", "id": 153768, "urlKey": "williamsburg-brooklyn-ny"},
     {"name": "Brooklyn Heights", "id": 153728, "urlKey": "brooklyn-heights-brooklyn-ny"},
+    {"name": "Williamsburg", "id": 153768, "urlKey": "williamsburg-brooklyn-ny"},
     {"name": "Park Slope", "id": 153752, "urlKey": "park-slope-brooklyn-ny"},
     {"name": "DUMBO", "id": 153734, "urlKey": "dumbo-brooklyn-ny"},
     {"name": "Bushwick", "id": 153730, "urlKey": "bushwick-brooklyn-ny"},
@@ -671,14 +704,30 @@ def pull_category(conn, status, listing_type, category_label):
             mark_done(conn, category_label, borough_label, grand_total)
             continue
 
-        tprint(f"  [{borough['name']}] hit limit, partitioning into {len(hoods)} neighborhoods...")
-        for hood in hoods:
+        tprint(f"  [{borough['name']}] hit limit, partitioning into {len(hoods)} neighborhoods ({NUM_WORKERS} workers)...")
+
+        def _pull_hood(hood):
+            """Worker function — runs in thread pool with own DB connection."""
+            tc = thread_conn()
             hood_place = make_place(hood)
             hood_label = f"{category_label}/{hood['name']}"
-            hood_count = exhaustive_pull(conn, status, listing_type, hood_place,
-                                         hood_label, is_rental,
-                                         category_label=category_label)
-            grand_total += hood_count
+            try:
+                count = exhaustive_pull(tc, status, listing_type, hood_place,
+                                        hood_label, is_rental,
+                                        category_label=category_label)
+                return hood['name'], count
+            finally:
+                tc.close()
+
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            futures = {executor.submit(_pull_hood, hood): hood for hood in hoods}
+            for future in as_completed(futures):
+                hood = futures[future]
+                try:
+                    name, count = future.result()
+                    grand_total += count
+                except Exception as e:
+                    tprint(f"  [ERROR] {hood['name']}: {e}")
 
         mark_done(conn, category_label, borough_label, grand_total)
 
