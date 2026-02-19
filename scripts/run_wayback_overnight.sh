@@ -29,7 +29,7 @@ while true; do
     fi
 
     # Fetch all pending
-    python3 scripts/streeteasy_wayback_history.py fetch --concurrency 20 --rate 15
+    python3 scripts/streeteasy_wayback_history.py fetch --concurrency 40 --rate 15
 
     PASS=$((PASS + 1))
 done

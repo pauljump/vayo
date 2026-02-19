@@ -1,55 +1,51 @@
 #!/usr/bin/env python3
-"""Build complete NYC units database from PLUTO + discovered units."""
+"""
+Build complete NYC units database from PLUTO + all discovered unit sources.
+
+Sources:
+1. canonical_units from stuytown.db (HPD, ECB text mining, 311 text mining, etc.)
+2. ACRIS transactions from vayo_clean.db (full 22.5M legals with unit data)
+
+Run AFTER build_clean_db.py (needs vayo_clean.db to exist).
+"""
 
 import sqlite3
+import json
 import time
 import os
 
 BIG_DB = "/Users/pjump/Desktop/projects/vayo/stuy-scrape-csv/stuytown.db"
+CLEAN_DB = "/Users/pjump/Desktop/projects/vayo/vayo_clean.db"
 NEW_DB = "/Users/pjump/Desktop/projects/vayo/all_nyc_units.db"
+
+JUNK_UNITS = {'N/A', 'NA', '0', '00', '000', '-', '.', 'NONE', 'X', 'XX',
+              'TIMES', 'APT', 'UNIT', 'BLDG', 'BUILDING', 'ALL', 'ENTIRE',
+              'BSMT', 'BASEMENT', 'CELLAR', 'STORE', 'GARAGE', 'PARKING',
+              'ROOF', 'LOBBY', 'HALLWAY', 'COMMON', 'COMMERCIAL', 'OFFICE',
+              'SUPER', 'BOILER', 'PUBLIC', 'VACANT', 'OUTSIDE', 'HALL',
+              'STAIRS', 'STAIRWAY'}
 
 # Remove old DB
 if os.path.exists(NEW_DB):
     os.remove(NEW_DB)
 
-print("=== Step 1: Export from big DB ===")
 t0 = time.time()
 
-big = sqlite3.connect(BIG_DB)
-big.execute("PRAGMA journal_mode=WAL")
+# ============================================================================
+# Step 1: Load PLUTO from vayo_clean.db
+# ============================================================================
+print("=== Step 1: Load PLUTO buildings ===")
+clean = sqlite3.connect(CLEAN_DB)
 
-# Export PLUTO
-pluto_rows = big.execute("""
-    SELECT CAST(bbl AS INTEGER), borough, address, zipcode, bldgclass,
-           yearbuilt, numfloors, unitsres, unitstotal, ownername, zonedist1,
-           assesstot, lotarea, bldgarea, resarea
-    FROM pluto WHERE unitsres > 0
-""").fetchall()
-print(f"  PLUTO: {len(pluto_rows)} buildings")
-
-# Export canonical_units (BBL-matched only)
-cu_rows = big.execute("""
-    SELECT unit_id, bbl, bin, borough, unit_number, full_address,
-           ownership_type, source_systems, confidence_score
-    FROM canonical_units
-    WHERE bbl IS NOT NULL AND LENGTH(bbl) = 10 AND bbl != '0000000000'
-""").fetchall()
-print(f"  Canonical units: {len(cu_rows)} units")
-big.close()
-print(f"  Export took {time.time()-t0:.1f}s")
-
-# Build PLUTO lookup
-print("\n=== Step 2: Build lookups ===")
-t1 = time.time()
-
-# BBL -> pluto row
 pluto_by_bbl = {}
-# boro_block -> best pluto BBL (most units)
 pluto_by_block = {}
 
-for row in pluto_rows:
-    bbl = row[0]
-    unitsres = row[7]
+for row in clean.execute("""
+    SELECT bbl, borough, address, zipcode, bldgclass,
+           yearbuilt, numfloors, unitsres
+    FROM buildings WHERE unitsres > 0
+"""):
+    bbl, borough, address, zipcode, bldgclass, yearbuilt, numfloors, unitsres = row
     pluto_by_bbl[bbl] = row
 
     bbl_str = str(bbl)
@@ -58,22 +54,53 @@ for row in pluto_rows:
         if boro_block not in pluto_by_block or unitsres > pluto_by_block[boro_block][7]:
             pluto_by_block[boro_block] = row
 
-print(f"  {len(pluto_by_bbl)} BBL lookups, {len(pluto_by_block)} boro+block lookups")
+print(f"  {len(pluto_by_bbl):,} buildings, {len(pluto_by_block):,} boro+block lookups")
 
-# Map canonical units to PLUTO buildings
-mapped = []  # (unit_id, matched_bbl, unit_number, full_address, ownership_type, source_systems, confidence)
-unmatched = 0
+# ============================================================================
+# Step 2: Collect units from all sources
+# ============================================================================
+# Store as: {(bbl_str, unit_number): (source_systems, confidence, ownership_type, address)}
+discovered = {}
 
-for row in cu_rows:
-    unit_id, bbl_str, bin_val, borough, unit_number, full_address, ownership_type, source_systems, confidence = row
-    bbl_int = int(bbl_str) if bbl_str else None
+def add_unit(bbl_int, unit_number, source, confidence=0.8, ownership_type=None, address=None):
+    """Add a discovered unit, deduplicating by bbl+unit."""
+    if not unit_number or unit_number.upper().strip() in JUNK_UNITS:
+        return
+    unit_number = unit_number.strip()
+    if len(unit_number) > 10:
+        return
+    bbl_str = str(bbl_int)
+    key = (bbl_str, unit_number)
+    if key in discovered:
+        # Merge sources
+        existing = discovered[key]
+        sources = json.loads(existing[0])
+        if source not in sources:
+            sources.append(source)
+        # Keep highest confidence
+        discovered[key] = (json.dumps(sources), max(existing[1], confidence),
+                          existing[2] or ownership_type, existing[3] or address)
+    else:
+        discovered[key] = (json.dumps([source]), confidence, ownership_type, address)
+
+# --- Source A: canonical_units from stuytown.db ---
+print("\n=== Step 2a: canonical_units from stuytown.db ===")
+big = sqlite3.connect(BIG_DB)
+cu_count = 0
+for row in big.execute("""
+    SELECT bbl, unit_number, source_systems, confidence_score, ownership_type, full_address
+    FROM canonical_units
+    WHERE bbl IS NOT NULL AND LENGTH(bbl) = 10 AND bbl != '0000000000'
+    AND unit_number IS NOT NULL AND unit_number != ''
+"""):
+    bbl_str = row[0]
+    bbl_int = int(bbl_str)
+
+    # Map condo lots to building BBL
     matched_bbl = None
-
-    # Direct match
     if bbl_int in pluto_by_bbl:
         matched_bbl = bbl_int
-    elif len(bbl_str) == 10:
-        # Condo lot mapping
+    else:
         lot = int(bbl_str[6:10])
         if lot >= 1000:
             boro_block = bbl_str[:6]
@@ -81,26 +108,60 @@ for row in cu_rows:
                 matched_bbl = pluto_by_block[boro_block][0]
 
     if matched_bbl is not None:
-        mapped.append((unit_id, matched_bbl, unit_number, full_address, ownership_type, source_systems, confidence))
-    else:
-        unmatched += 1
+        # Parse existing sources and add each
+        try:
+            sources = json.loads(row[2]) if row[2] else ['UNKNOWN']
+        except json.JSONDecodeError:
+            sources = [row[2]]
+        for src in sources:
+            add_unit(matched_bbl, row[1], src, row[3] or 0.8, row[4], row[5])
+        cu_count += 1
 
-print(f"  Matched: {len(mapped)}, Unmatched: {unmatched}")
-print(f"  Mapping took {time.time()-t1:.1f}s")
+big.close()
+print(f"  {cu_count:,} canonical units mapped")
 
-# Count discovered per building
+# --- Source B: ACRIS transactions from vayo_clean.db ---
+print("\n=== Step 2b: ACRIS units from vayo_clean.db ===")
+acris_count = 0
+for row in clean.execute("""
+    SELECT bbl, unit FROM acris_transactions
+    WHERE unit IS NOT NULL AND unit != ''
+"""):
+    add_unit(row[0], row[1], 'ACRIS_FULL', 0.9)
+    acris_count += 1
+
+print(f"  {acris_count:,} ACRIS transaction rows with units")
+
+# --- Source C: HPD complaints from vayo_clean.db ---
+print("\n=== Step 2c: HPD complaint units from vayo_clean.db ===")
+hpd_count = 0
+for row in clean.execute("""
+    SELECT DISTINCT bbl, unit FROM complaints
+    WHERE unit IS NOT NULL AND unit != ''
+"""):
+    add_unit(row[0], row[1], 'HPD', 0.85)
+    hpd_count += 1
+
+print(f"  {hpd_count:,} distinct HPD bbl+unit combos")
+
+clean.close()
+print(f"\n  Total discovered units: {len(discovered):,}")
+
+# ============================================================================
+# Step 3: Gap analysis
+# ============================================================================
 print("\n=== Step 3: Gap analysis ===")
 bldg_discovered = {}
-for m in mapped:
-    bbl = m[1]
-    bldg_discovered[bbl] = bldg_discovered.get(bbl, 0) + 1
+for (bbl_str, unit_num) in discovered:
+    bbl_int = int(bbl_str)
+    bldg_discovered[bbl_int] = bldg_discovered.get(bbl_int, 0) + 1
 
 fully_covered = 0
 partial = 0
 zero_coverage = 0
 total_gap = 0
+gaps = []
 
-gaps = []  # (bbl, pluto_row, discovered, gap)
 for bbl, prow in pluto_by_bbl.items():
     expected = prow[7]  # unitsres
     disc = bldg_discovered.get(bbl, 0)
@@ -116,19 +177,21 @@ for bbl, prow in pluto_by_bbl.items():
         gaps.append((bbl, prow, disc, gap))
     total_gap += gap
 
-print(f"  Fully covered: {fully_covered}")
-print(f"  Partially covered: {partial}")
-print(f"  Zero coverage: {zero_coverage}")
-print(f"  Placeholders needed: {total_gap}")
+print(f"  Fully covered: {fully_covered:,}")
+print(f"  Partially covered: {partial:,}")
+print(f"  Zero coverage: {zero_coverage:,}")
+print(f"  Placeholders needed: {total_gap:,}")
 
-# Build the new database
+# ============================================================================
+# Step 4: Build the database
+# ============================================================================
 print("\n=== Step 4: Build all_nyc_units database ===")
 t2 = time.time()
 
 new = sqlite3.connect(NEW_DB)
 new.execute("PRAGMA journal_mode=WAL")
 new.execute("PRAGMA synchronous=NORMAL")
-new.execute("PRAGMA cache_size=-200000")  # 200MB cache
+new.execute("PRAGMA cache_size=-200000")
 
 new.execute("""
     CREATE TABLE all_nyc_units (
@@ -150,27 +213,33 @@ new.execute("""
 
 # Insert discovered units
 print("  Inserting discovered units...")
-disc_rows = []
-for m in mapped:
-    unit_id, matched_bbl, unit_number, full_address, ownership_type, source_systems, confidence = m
-    prow = pluto_by_bbl[matched_bbl]
-    # prow: bbl, borough, address, zipcode, bldgclass, yearbuilt, numfloors, ...
-    disc_rows.append((
-        unit_id, str(matched_bbl), prow[1], full_address or prow[2],
-        prow[3], unit_number, 0, source_systems, confidence, ownership_type,
+batch = []
+for (bbl_str, unit_number), (sources, confidence, ownership, address) in discovered.items():
+    bbl_int = int(bbl_str)
+    prow = pluto_by_bbl.get(bbl_int)
+    if not prow:
+        continue
+    unit_id = f"{bbl_str}-{unit_number}"
+    batch.append((
+        unit_id, bbl_str, prow[1], address or prow[2],
+        prow[3], unit_number, 0, sources, confidence, ownership,
         prow[4], prow[5], prow[6]
     ))
+    if len(batch) >= 50000:
+        new.executemany("INSERT OR IGNORE INTO all_nyc_units VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+        new.commit()
+        batch = []
 
-new.executemany("""
-    INSERT OR IGNORE INTO all_nyc_units VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-""", disc_rows)
-new.commit()
-print(f"  Inserted {len(disc_rows)} discovered units")
+if batch:
+    new.executemany("INSERT OR IGNORE INTO all_nyc_units VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+    new.commit()
+
+disc_inserted = new.execute("SELECT COUNT(*) FROM all_nyc_units").fetchone()[0]
+print(f"  Inserted {disc_inserted:,} discovered units")
 
 # Insert placeholders
 print("  Generating placeholders...")
 batch = []
-batch_size = 50000
 total_ph = 0
 
 for bbl, prow, disc, gap in gaps:
@@ -186,7 +255,7 @@ for bbl, prow, disc, gap in gaps:
         ))
         total_ph += 1
 
-        if len(batch) >= batch_size:
+        if len(batch) >= 50000:
             new.executemany("INSERT INTO all_nyc_units VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
             new.commit()
             print(f"    ... {total_ph:,} placeholders")
@@ -237,7 +306,8 @@ for row in new.execute("""
 print("\n--- BY SOURCE ---")
 for row in new.execute("""
     SELECT CASE
-        WHEN source_systems LIKE '%ACRIS%' THEN 'ACRIS'
+        WHEN source_systems LIKE '%ACRIS_FULL%' THEN 'ACRIS (full cache)'
+        WHEN source_systems LIKE '%ACRIS%' THEN 'ACRIS (legacy)'
         WHEN source_systems LIKE '%HPD%' THEN 'HPD'
         WHEN source_systems LIKE '%TEXT_MINED%' THEN 'Text Mining'
         WHEN source_systems LIKE '%PLUTO%' THEN 'PLUTO Inferred'

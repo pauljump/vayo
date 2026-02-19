@@ -10,7 +10,9 @@ Output: vayo_clean.db with properly joined tables
 
 import sqlite3
 import time
+import json
 from collections import defaultdict
+from pathlib import Path
 
 BIG_DB = "/Users/pjump/Desktop/projects/vayo/stuy-scrape-csv/stuytown.db"
 OUT_DB = "/Users/pjump/Desktop/projects/vayo/vayo_clean.db"
@@ -92,9 +94,25 @@ out.execute("CREATE INDEX idx_bm_bbl ON bin_map(bbl)")
 out.commit()
 
 # ============================================================================
-# 3. ACRIS — build proper BBLs from boro+block+lot, link to PLUTO
+# 3. ACRIS — stream from full cache files, link to PLUTO
 # ============================================================================
-print("\n=== 3. ACRIS transactions ===")
+print("\n=== 3. ACRIS transactions (from full cache) ===")
+
+ACRIS_CACHE = "/Users/pjump/Desktop/projects/vayo/acris_cache/full"
+TARGET_DOC_TYPES = {
+    'DEED', 'MTGE', 'SAT', 'AGMT', 'LPNS', 'AL&R', 'AALR', 'LPEN', 'RPTT&RET',
+    'DEED, TS',  # Tax sale deeds (distress signal)
+    'DEED, LE',  # Life estate deeds
+    'ASST',      # Mortgage assignments (bank-to-bank transfers)
+    'PREL',      # Pre-liens (foreclosure indicator)
+}
+JUNK_UNITS = {'N/A', 'NA', '0', '00', '000', '-', '.', 'NONE', 'X', 'XX', 'TIMES', 'APT', 'UNIT'}
+
+def iter_cache_dir(path):
+    """Iterate over all batch_*.json files in a directory (flat or nested)."""
+    for f in sorted(Path(path).glob('**/batch_*.json')):
+        with open(f) as fh:
+            yield from json.load(fh)
 
 # Build boro_block → PLUTO BBL mapping for condo lots
 pluto_by_block = defaultdict(list)
@@ -121,37 +139,40 @@ out.execute("""
     )
 """)
 
-# Process ACRIS: join master + real_property + parties
-print("  Loading ACRIS data...")
-# First get all documents with their parties pre-aggregated
-doc_parties = defaultdict(lambda: {'sellers': [], 'buyers': []})
-for row in big.execute("""
-    SELECT document_id, party_type, name FROM acris_parties
-    WHERE party_type IN ('1', '2') AND name IS NOT NULL AND name <> ''
-"""):
-    if row['party_type'] == '1':
-        doc_parties[row['document_id']]['sellers'].append(row['name'])
-    else:
-        doc_parties[row['document_id']]['buyers'].append(row['name'])
+# --- Step 1: Stream master → filter to target doc types ---
+print("  Step 1: Streaming master records...")
+master_docs = {}  # {doc_id: (doc_type, document_amt, document_date, recorded_datetime)}
+master_total = 0
+for rec in iter_cache_dir(f"{ACRIS_CACHE}/master"):
+    master_total += 1
+    if rec['doc_type'] in TARGET_DOC_TYPES:
+        try:
+            amt = float(rec['document_amt']) if rec['document_amt'] else 0
+        except (ValueError, TypeError):
+            amt = 0
+        master_docs[rec['document_id']] = (
+            rec['doc_type'], amt,
+            rec['document_date'], rec['recorded_datetime']
+        )
+    if master_total % 5_000_000 == 0:
+        print(f"    scanned {master_total:,} master, kept {len(master_docs):,}")
+print(f"    Done: {master_total:,} master scanned → {len(master_docs):,} target docs")
 
-print(f"  {len(doc_parties)} documents with parties")
-
-# Now process real_property + master
-acris_count = 0
-batch = []
-for row in big.execute("""
-    SELECT r.document_id, r.borough, r.block, r.lot, r.unit,
-           m.doc_type, m.document_date, m.recorded_datetime, m.document_amt
-    FROM acris_real_property r
-    JOIN acris_master m ON m.document_id = r.document_id
-    WHERE r.borough IS NOT NULL AND r.block IS NOT NULL AND r.lot IS NOT NULL
-    AND m.doc_type IN ('DEED','MTGE','SAT','AL&R','AALR','LPEN','RPTT&RET','AGMT')
-"""):
+# --- Step 2: Stream legals → match to master + PLUTO → doc_bbl ---
+print("  Step 2: Streaming legals records...")
+doc_bbl = {}  # {doc_id: (bbl, unit)}
+legals_total = 0
+for rec in iter_cache_dir(f"{ACRIS_CACHE}/legals_parts"):
+    legals_total += 1
+    doc_id = rec['document_id']
+    if doc_id not in master_docs:
+        continue
     # Construct BBL
     try:
-        boro = str(int(row['borough']))
-        block = str(int(row['block'])).zfill(5)
-        lot = str(int(row['lot'])).zfill(5) if row['lot'] else '00000'
+        boro = str(int(rec['borough']))
+        block = str(int(rec['block'])).zfill(5)
+        lot_raw = rec.get('lot')
+        lot = str(int(lot_raw)).zfill(4) if lot_raw else '0000'
         constructed_bbl = int(boro + block + lot)
     except (ValueError, TypeError):
         continue
@@ -161,35 +182,62 @@ for row in big.execute("""
     if constructed_bbl in valid_bbls:
         matched_bbl = constructed_bbl
     else:
-        # Condo lot mapping
-        bb = (boro + block)
+        bb = boro + block
         lot_num = int(lot)
         if lot_num >= 1000 and bb in pluto_by_block:
-            matched_bbl = pluto_by_block[bb][0][0]  # biggest building on block
+            matched_bbl = pluto_by_block[bb][0][0]
 
-    if matched_bbl is None:
+    if matched_bbl is not None:
+        unit = (rec.get('unit') or '').strip()
+        if unit.upper() in JUNK_UNITS:
+            unit = ''
+        doc_bbl[doc_id] = (matched_bbl, unit)
+
+    if legals_total % 5_000_000 == 0:
+        print(f"    scanned {legals_total:,} legals, matched {len(doc_bbl):,}")
+print(f"    Done: {legals_total:,} legals scanned → {len(doc_bbl):,} matched to PLUTO")
+
+# --- Step 3: Stream parties → only for matched doc_ids ---
+print("  Step 3: Streaming parties records...")
+doc_parties = defaultdict(lambda: {'sellers': [], 'buyers': []})
+parties_total = 0
+parties_kept = 0
+for rec in iter_cache_dir(f"{ACRIS_CACHE}/parties_parts"):
+    parties_total += 1
+    doc_id = rec['document_id']
+    if doc_id not in doc_bbl:
         continue
+    if not rec.get('name'):
+        continue
+    parties_kept += 1
+    bucket = doc_parties[doc_id]
+    if rec['party_type'] == '1':
+        if len(bucket['sellers']) < 3:
+            bucket['sellers'].append(rec['name'])
+    else:
+        if len(bucket['buyers']) < 3:
+            bucket['buyers'].append(rec['name'])
+    if parties_total % 10_000_000 == 0:
+        print(f"    scanned {parties_total:,} parties, kept {parties_kept:,}")
+print(f"    Done: {parties_total:,} parties scanned → {len(doc_parties):,} docs with parties")
 
-    try:
-        amt = float(row['document_amt']) if row['document_amt'] else 0
-    except:
-        amt = 0
+# --- Step 4: Join and insert ---
+print("  Step 4: Joining and inserting...")
+acris_count = 0
+batch = []
+for doc_id, (bbl, unit) in doc_bbl.items():
+    doc_type, amt, doc_date, rec_dt = master_docs[doc_id]
+    parties = doc_parties.get(doc_id, {'sellers': [], 'buyers': []})
+    sellers = '; '.join(parties['sellers'])[:200]
+    buyers = '; '.join(parties['buyers'])[:200]
 
-    parties = doc_parties.get(row['document_id'], {'sellers': [], 'buyers': []})
-    sellers = '; '.join(set(parties['sellers']))[:200]
-    buyers = '; '.join(set(parties['buyers']))[:200]
-
-    batch.append((
-        row['document_id'], matched_bbl, row['unit'] or '',
-        row['doc_type'], row['document_date'], row['recorded_datetime'],
-        amt, sellers, buyers
-    ))
+    batch.append((doc_id, bbl, unit, doc_type, doc_date, rec_dt, amt, sellers, buyers))
 
     if len(batch) >= 50000:
         out.executemany("INSERT INTO acris_transactions VALUES (?,?,?,?,?,?,?,?,?)", batch)
         out.commit()
         acris_count += len(batch)
-        print(f"    {acris_count:,} transactions...")
+        print(f"    {acris_count:,} transactions inserted...")
         batch = []
 
 if batch:
@@ -202,6 +250,9 @@ out.execute("CREATE INDEX idx_acris_type ON acris_transactions(doc_type)")
 out.execute("CREATE INDEX idx_acris_date ON acris_transactions(recorded_datetime)")
 out.commit()
 print(f"  {acris_count:,} ACRIS transactions matched to PLUTO buildings")
+
+# Free memory
+del master_docs, doc_bbl, doc_parties
 
 # ============================================================================
 # 4. HPD Complaints (by BIN → BBL)
@@ -488,6 +539,158 @@ evict_count = out.execute("SELECT COUNT(*) FROM marshal_evictions").fetchone()[0
 print(f"  {evict_count:,} residential evictions loaded (address-only, no BBL)")
 
 # ============================================================================
+# 12. StreetEasy slug → BBL mapping
+# ============================================================================
+print("\n=== 12. StreetEasy slug → BBL mapping ===")
+
+SE_SLUGS_FILE = "/Users/pjump/Desktop/projects/vayo/se_sitemaps/all_buildings.txt"
+
+# NYC neighborhood/city → borough mapping
+NYC_CITIES = {
+    'new_york': 'MN', 'manhattan': 'MN',
+    'brooklyn': 'BK', 'bronx': 'BX', 'queens': 'QN', 'staten_island': 'SI',
+    # Brooklyn neighborhoods
+    'bed_stuy': 'BK', 'williamsburg': 'BK', 'bushwick': 'BK', 'park_slope': 'BK',
+    'greenpoint': 'BK', 'flatbush': 'BK', 'crown_heights': 'BK',
+    'east_new_york': 'BK', 'sunset_park': 'BK', 'bay_ridge': 'BK',
+    'bensonhurst': 'BK', 'sheepshead_bay': 'BK', 'canarsie': 'BK',
+    'east_flatbush': 'BK', 'brownsville': 'BK', 'prospect_heights': 'BK',
+    'prospect_lefferts_gardens': 'BK', 'windsor_terrace': 'BK', 'kensington': 'BK',
+    'borough_park': 'BK', 'dyker_heights': 'BK', 'gravesend': 'BK', 'midwood': 'BK',
+    'brighton_beach': 'BK', 'coney_island': 'BK', 'marine_park': 'BK',
+    'mill_basin': 'BK', 'cobble_hill': 'BK', 'carroll_gardens': 'BK',
+    'boerum_hill': 'BK', 'fort_greene': 'BK', 'clinton_hill': 'BK', 'dumbo': 'BK',
+    'downtown_brooklyn': 'BK', 'brooklyn_heights': 'BK', 'red_hook': 'BK',
+    'gowanus': 'BK', 'flatlands': 'BK', 'bergen_beach': 'BK',
+    'gerritsen_beach': 'BK', 'manhattan_beach': 'BK', 'bath_beach': 'BK',
+    'cypress_hills': 'BK', 'east_williamsburg': 'BK', 'greenwood': 'BK',
+    'south_slope': 'BK', 'ditmas_park': 'BK', 'victorian_flatbush': 'BK',
+    'prospect_park_south': 'BK', 'columbia_street_waterfront': 'BK',
+    'vinegar_hill': 'BK', 'navy_yard': 'BK', 'weeksville': 'BK',
+    'stuyvesant_heights': 'BK', 'ocean_hill': 'BK', 'starrett_city': 'BK',
+    'remsen_village': 'BK', 'rugby': 'BK', 'sea_gate': 'BK',
+    # Queens neighborhoods
+    'astoria': 'QN', 'flushing': 'QN', 'jamaica': 'QN', 'ozone_park': 'QN',
+    'south_ozone_park': 'QN', 'corona': 'QN', 'jackson_heights': 'QN',
+    'queens_village': 'QN', 'forest_hills': 'QN', 'richmond_hill': 'QN',
+    'south_richmond_hill': 'QN', 'saint_albans': 'QN', 'hollis': 'QN',
+    'east_elmhurst': 'QN', 'far_rockaway': 'QN', 'woodside': 'QN',
+    'rego_park': 'QN', 'bayside': 'QN', 'long_island_city': 'QN',
+    'sunnyside': 'QN', 'kew_gardens': 'QN', 'elmhurst': 'QN', 'ridgewood': 'QN',
+    'middle_village': 'QN', 'maspeth': 'QN', 'woodhaven': 'QN',
+    'howard_beach': 'QN', 'springfield_gardens': 'QN', 'fresh_meadows': 'QN',
+    'college_point': 'QN', 'whitestone': 'QN', 'belle_harbor': 'QN',
+    'rockaway_park': 'QN', 'arverne': 'QN', 'cambria_heights': 'QN',
+    'laurelton': 'QN', 'rosedale': 'QN', 'briarwood': 'QN', 'oakland_gardens': 'QN',
+    'glen_oaks': 'QN', 'little_neck': 'QN', 'douglaston': 'QN',
+    'floral_park': 'QN', 'bellerose': 'QN', 'kew_gardens_hills': 'QN',
+    'south_jamaica': 'QN', 'st._albans': 'QN', 'addisleigh_park': 'QN',
+    'murray_hill_queens': 'QN', 'ditmars': 'QN', 'steinway': 'QN',
+    'hunters_point': 'QN', 'ravenswood': 'QN', 'broad_channel': 'QN',
+    'rockaway_beach': 'QN', 'neponsit': 'QN', 'breezy_point': 'QN',
+    # Bronx neighborhoods
+    'riverdale': 'BX', 'kingsbridge': 'BX', 'fordham': 'BX', 'pelham_bay': 'BX',
+    'throgs_neck': 'BX', 'morris_park': 'BX', 'parkchester': 'BX',
+    'soundview': 'BX', 'hunts_point': 'BX', 'mott_haven': 'BX',
+    'highbridge': 'BX', 'concourse': 'BX', 'tremont': 'BX', 'belmont': 'BX',
+    'university_heights': 'BX', 'norwood': 'BX', 'wakefield': 'BX',
+    'williamsbridge': 'BX', 'baychester': 'BX', 'co_op_city': 'BX',
+    'city_island': 'BX', 'country_club': 'BX', 'castle_hill': 'BX',
+    'clason_point': 'BX', 'van_nest': 'BX', 'westchester_square': 'BX',
+    'schuylerville': 'BX', 'edgewater_park': 'BX', 'spuyten_duyvil': 'BX',
+    'fieldston': 'BX', 'mount_hope': 'BX', 'morrisania': 'BX',
+    'longwood': 'BX', 'port_morris': 'BX', 'melrose': 'BX',
+    # Staten Island neighborhoods
+    'new_brighton': 'SI', 'st._george': 'SI', 'tompkinsville': 'SI',
+    'stapleton': 'SI', 'great_kills': 'SI', 'tottenville': 'SI',
+    'new_dorp': 'SI', 'midland_beach': 'SI', 'south_beach': 'SI',
+    'dongan_hills': 'SI', 'grant_city': 'SI', 'eltingville': 'SI',
+    'annadale': 'SI', 'huguenot': 'SI', 'princes_bay': 'SI',
+    'rossville': 'SI', 'woodrow': 'SI', 'charleston': 'SI',
+    'west_brighton': 'SI', 'port_richmond': 'SI', 'mariners_harbor': 'SI',
+    'bulls_head': 'SI', 'travis': 'SI', 'willowbrook': 'SI',
+    'westerleigh': 'SI', 'castleton_corners': 'SI', 'todt_hill': 'SI',
+    'richmondtown': 'SI', 'oakwood': 'SI', 'grasmere': 'SI',
+}
+
+def normalize_addr(addr):
+    """Normalize address for matching: uppercase, abbreviate street types."""
+    if not addr:
+        return ''
+    a = addr.upper().strip()
+    a = a.replace('_', '-')
+    # Abbreviate common suffixes
+    for full, abbr in [(' AVENUE', ' AVE'), (' STREET', ' ST'), (' BOULEVARD', ' BLVD'),
+                       (' DRIVE', ' DR'), (' PLACE', ' PL'), (' ROAD', ' RD'),
+                       (' COURT', ' CT'), (' LANE', ' LN'), (' TERRACE', ' TERR'),
+                       (' PARKWAY', ' PKWY'), (' SQUARE', ' SQ'), (' CRESCENT', ' CRES')]:
+        a = a.replace(full, abbr)
+    return a
+
+# Build PLUTO address lookup
+pluto_addr_lookup = {}
+for row in out.execute("SELECT bbl, address, borough FROM buildings"):
+    key = (normalize_addr(row[1]), row[2])
+    pluto_addr_lookup[key] = row[0]
+
+out.execute("""
+    CREATE TABLE se_buildings (
+        slug TEXT PRIMARY KEY,
+        bbl INTEGER,
+        se_address TEXT,
+        borough TEXT
+    )
+""")
+
+se_matched = 0
+se_total = 0
+batch = []
+
+if os.path.exists(SE_SLUGS_FILE):
+    with open(SE_SLUGS_FILE) as f:
+        for line in f:
+            slug = line.strip()
+            if not slug:
+                continue
+
+            # Parse slug: strip URL encoding, extract address and city
+            slug_clean = slug.split('?')[0].strip('/').lstrip('%23')
+
+            # Match city suffix (longest first to avoid partial matches)
+            matched_city = None
+            matched_boro = None
+            for city in sorted(NYC_CITIES.keys(), key=len, reverse=True):
+                if slug_clean.endswith('-' + city):
+                    matched_city = city
+                    matched_boro = NYC_CITIES[city]
+                    break
+
+            if not matched_boro:
+                continue
+
+            se_total += 1
+            addr_part = slug_clean[:-(len(matched_city) + 1)]
+            addr = normalize_addr(addr_part.replace('-', ' '))
+
+            bbl = pluto_addr_lookup.get((addr, matched_boro))
+            if bbl:
+                se_matched += 1
+                batch.append((slug, bbl, addr_part.replace('-', ' '), matched_boro))
+
+                if len(batch) >= 50000:
+                    out.executemany("INSERT OR IGNORE INTO se_buildings VALUES (?,?,?,?)", batch)
+                    out.commit()
+                    batch = []
+
+if batch:
+    out.executemany("INSERT OR IGNORE INTO se_buildings VALUES (?,?,?,?)", batch)
+    out.commit()
+
+out.execute("CREATE INDEX idx_se_bbl ON se_buildings(bbl)")
+out.commit()
+print(f"  {se_total:,} NYC slugs parsed, {se_matched:,} matched to PLUTO ({100*se_matched/max(se_total,1):.1f}%)")
+
+# ============================================================================
 # FINAL REPORT
 # ============================================================================
 print("\n" + "=" * 60)
@@ -496,7 +699,7 @@ print("=" * 60)
 
 for table in ['buildings', 'acris_transactions', 'complaints', 'complaints_311',
               'ecb_violations', 'building_contacts', 'hpd_litigation',
-              'dob_permits', 'dob_complaints', 'marshal_evictions', 'bin_map']:
+              'dob_permits', 'dob_complaints', 'marshal_evictions', 'se_buildings', 'bin_map']:
     count = out.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
     print(f"  {table:<25} {count:>12,}")
 

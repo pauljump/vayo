@@ -7,6 +7,18 @@
 nycdb_data/
 stuy-scrape-csv/
 
+# Cache/data directories
+acris_cache/
+data_cache/
+se_cache/
+se_sitemaps/*.xml.gz
+se_sitemaps/all_units.txt
+
+# Generated output
+results.json
+gramercy_test.json
+gramercy_v2.json
+
 # Logs
 *.log
 
@@ -17,3 +29,7 @@ stuy-scrape-csv/
 __pycache__/
 *.pyc
 venv/
+
+# Node
+web/node_modules/
+web/.next/
