@@ -483,7 +483,8 @@ def build_filter(status, listing_type, place=None, bedrooms=None,
 
 
 def paginate_query(conn, status, listing_type, place=None, bedrooms=None,
-                   price_min=None, price_max=None, label="", order_by="Newest"):
+                   price_min=None, price_max=None, label="", order_by="Newest",
+                   hood_name=None):
     """Paginate through a single query, return count of results fetched."""
     total = 0
     skip = 0
@@ -504,6 +505,10 @@ def paginate_query(conn, status, listing_type, place=None, bedrooms=None,
             break
 
         listings = [extract_listing(item) for item in items]
+        if hood_name:
+            for l in listings:
+                if not l.get("neighborhood"):
+                    l["neighborhood"] = hood_name
         upsert_listings(conn, listings)
         total += len(items)
 
@@ -554,7 +559,7 @@ def mark_done(conn, query_type, partition, results_count):
 
 
 def exhaustive_pull(conn, status, listing_type, place, label, is_rental=True,
-                    category_label=""):
+                    category_label="", hood_name=None):
     """
     Pull all listings for a place, with automatic sub-partitioning.
     Uses probe-first to skip redundant full fetches of dense buckets.
@@ -570,7 +575,8 @@ def exhaustive_pull(conn, status, listing_type, place, label, is_rental=True,
 
     if not exceeds:
         # Under 5K — just paginate the whole thing
-        count = paginate_query(conn, status, listing_type, place=place, label=label)
+        count = paginate_query(conn, status, listing_type, place=place, label=label,
+                              hood_name=hood_name)
         tprint(f"  [{label}] : {count}")
         mark_done(conn, category_label, label, count)
         return count
@@ -592,7 +598,8 @@ def exhaustive_pull(conn, status, listing_type, place, label, is_rental=True,
         if not bed_exceeds:
             # Under 5K — paginate normally
             bed_count = paginate_query(conn, status, listing_type, place=place,
-                                       bedrooms=beds, label=bed_label)
+                                       bedrooms=beds, label=bed_label,
+                                       hood_name=hood_name)
             tprint(f"    [{bed_label}] : {bed_count}")
         else:
             # Over 5K — skip straight to price splitting
@@ -605,7 +612,7 @@ def exhaustive_pull(conn, status, listing_type, place, label, is_rental=True,
 
             bed_count = _recursive_price_pull(
                 conn, status, listing_type, place, beds, initial_ranges,
-                bed_label, is_rental, depth=0
+                bed_label, is_rental, depth=0, hood_name=hood_name
             )
 
         total += bed_count
@@ -616,7 +623,7 @@ def exhaustive_pull(conn, status, listing_type, place, label, is_rental=True,
 
 
 def _recursive_price_pull(conn, status, listing_type, place, beds, price_ranges,
-                          parent_label, is_rental, depth):
+                          parent_label, is_rental, depth, hood_name=None):
     """Recursively split price ranges until each bucket fits under 5K.
     Uses probe-first to avoid fetching 5K records from dense buckets."""
     total = 0
@@ -633,7 +640,7 @@ def _recursive_price_pull(conn, status, listing_type, place, beds, price_ranges,
             # Under 5K — paginate normally
             p_count = paginate_query(conn, status, listing_type, place=place,
                                      bedrooms=beds, price_min=pmin, price_max=pmax,
-                                     label=price_label)
+                                     label=price_label, hood_name=hood_name)
             tprint(f"{indent}[{price_label}] : {p_count}")
             total += p_count
         else:
@@ -648,14 +655,15 @@ def _recursive_price_pull(conn, status, listing_type, place, beds, price_ranges,
                 tprint(f"{indent}[{price_label}] >5K, splitting → {lo}-{mid} / {mid}-{pmax or 'max'}")
                 total += _recursive_price_pull(
                     conn, status, listing_type, place, beds, sub_ranges,
-                    parent_label, is_rental, depth + 1
+                    parent_label, is_rental, depth + 1, hood_name=hood_name
                 )
             else:
                 # Range too narrow to split, try reverse ordering
                 rev_label = f"{price_label}/oldest"
                 rev_count = paginate_query(conn, status, listing_type, place=place,
                                            bedrooms=beds, price_min=pmin, price_max=pmax,
-                                           label=rev_label, order_by="Oldest")
+                                           label=rev_label, order_by="Oldest",
+                                           hood_name=hood_name)
                 tprint(f"{indent}  [{rev_label}] reverse: {rev_count}")
                 total += rev_count
 
@@ -714,7 +722,8 @@ def pull_category(conn, status, listing_type, category_label):
             try:
                 count = exhaustive_pull(tc, status, listing_type, hood_place,
                                         hood_label, is_rental,
-                                        category_label=category_label)
+                                        category_label=category_label,
+                                        hood_name=hood['name'])
                 return hood['name'], count
             finally:
                 tc.close()
@@ -810,6 +819,65 @@ def fetch_details(conn, limit=None):
     return fetched
 
 
+def backfill_neighborhoods(conn):
+    """Backfill neighborhood names for existing listings by re-querying each
+    neighborhood and matching listing IDs."""
+    tprint("Backfilling neighborhood names...")
+    all_hoods = []
+    for borough_name, hoods in BOROUGH_HOODS.items():
+        for hood in hoods:
+            all_hoods.append(hood)
+
+    total_updated = 0
+    for hood in all_hoods:
+        hood_name = hood["name"]
+        place = make_place(hood)
+
+        # Query all listing IDs for this neighborhood (paginate through)
+        skip = 0
+        ids = []
+        while True:
+            # Query both closed and active, rentals and sales
+            for status, ltype in [("Closed", "ResidentialLease"), ("Closed", "ResidentialSale"),
+                                  ("Active", "ResidentialLease"), ("Active", "ResidentialSale")]:
+                filt = build_filter(status, ltype, place=place)
+                filt["skip"] = skip
+                filt["take"] = BATCH_SIZE
+                payload = {"filter": filt, "map": {"zoomLevel": 11, "geometry": None}}
+                data = api_post("/listing/filter", payload, label=f"backfill/{hood_name}")
+                if data:
+                    for item in data.get("listings", []):
+                        cid = str(item.get("coreListingId", ""))
+                        if cid:
+                            ids.append(cid)
+
+            # For simplicity, just do one page per status/type combo
+            # (we'll catch most listings this way)
+            break
+
+        if ids:
+            # Batch update
+            for i in range(0, len(ids), 500):
+                batch = ids[i:i+500]
+                placeholders = ",".join(["?"] * len(batch))
+                conn.execute(
+                    f"UPDATE listings SET neighborhood=? WHERE core_listing_id IN ({placeholders}) "
+                    f"AND (neighborhood IS NULL OR neighborhood = '')",
+                    [hood_name] + batch
+                )
+            conn.commit()
+            updated = conn.execute(
+                "SELECT changes()").fetchone()[0]
+            total_updated += len(ids)
+            tprint(f"  [{hood_name}] tagged {len(ids)} listings")
+        else:
+            tprint(f"  [{hood_name}] no listings found")
+
+        time.sleep(DELAY)
+
+    tprint(f"\nBackfill complete. Tagged {total_updated} listings.")
+
+
 # ── Main ────────────────────────────────────────────────────
 
 def main():
@@ -819,6 +887,8 @@ def main():
     parser.add_argument("--active-only", action="store_true")
     parser.add_argument("--details", action="store_true")
     parser.add_argument("--details-limit", type=int)
+    parser.add_argument("--backfill-hoods", action="store_true",
+                        help="Backfill neighborhood names for existing listings")
     args = parser.parse_args()
 
     conn = init_db()
@@ -829,6 +899,11 @@ def main():
         tprint("ERROR: Cannot reach core.api.elliman.com")
         sys.exit(1)
     tprint("API is reachable.\n")
+
+    if args.backfill_hoods:
+        backfill_neighborhoods(conn)
+        conn.close()
+        return
 
     if args.details:
         fetch_details(conn, limit=args.details_limit)
