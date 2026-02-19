@@ -293,10 +293,9 @@ BROOKLYN_HOODS = [
     {"name": "Sheepshead Bay", "id": 153759, "urlKey": "sheepshead-bay-brooklyn-ny"},
 ]
 
-BOROUGH_HOODS = {
-    "Manhattan": MANHATTAN_HOODS,
-    "Brooklyn": BROOKLYN_HOODS,
-}
+# Neighborhood-level IDs are unreliable (most map to wrong areas).
+# All boroughs use borough-level bedroom+price partitioning instead.
+BOROUGH_HOODS = {}
 
 # ── Price range partitions for sub-splitting ────────────────
 
@@ -328,6 +327,7 @@ SALE_PRICE_RANGES = [
     (8000000, None),
 ]
 
+RESULT_CAP = 300  # API recycles results after this many unique IDs
 BEDROOM_VALUES = [0, 1, 2, 3, 4, 5]  # 5 = 5+
 
 
@@ -445,13 +445,14 @@ def upsert_listings(conn, listings):
 # ── Core query engine ───────────────────────────────────────
 
 def build_filter(status, listing_type, place=None, bedrooms=None,
-                 price_min=None, price_max=None, order_by="Newest"):
+                 price_min=None, price_max=None, order_by="Newest",
+                 home_type=None):
     """Build the full filter payload."""
     f = {
         "styles": None,
         "statuses": [status],
         "features": None,
-        "homeTypes": None,
+        "homeTypes": [home_type] if home_type else None,
         "timeOnMls": None,
         "isAgencyOnly": False,
         "isPetAllowed": False,
@@ -482,58 +483,31 @@ def build_filter(status, listing_type, place=None, bedrooms=None,
     return f
 
 
-def paginate_query(conn, status, listing_type, place=None, bedrooms=None,
-                   price_min=None, price_max=None, label="", order_by="Newest",
-                   hood_name=None):
-    """Paginate through a single query, return count of results fetched."""
-    total = 0
-    skip = 0
-
-    while skip <= MAX_SKIP:
-        filt = build_filter(status, listing_type, place, bedrooms, price_min, price_max, order_by)
+def paginate_unique(status, listing_type, place=None, bedrooms=None,
+                    price_min=None, price_max=None):
+    """Paginate a query, return set of unique (coreListingId, raw_item) pairs.
+    Stops when the API starts recycling IDs (after ~300 unique)."""
+    seen = {}  # id -> raw item
+    for skip in range(0, MAX_SKIP + 1, BATCH_SIZE):
+        filt = build_filter(status, listing_type, place, bedrooms, price_min, price_max)
         filt["skip"] = skip
-
         payload = {"filter": filt, "map": {"zoomLevel": 11, "geometry": None}}
-        data = api_post("/listing/filter", payload, label=f"{label} @{skip}")
-
+        data = api_post("/listing/filter", payload, label=f"@{skip}")
         if not data:
-            tprint(f"    [{label}] FAILED at skip={skip}")
             break
-
         items = data.get("listings", [])
         if not items:
             break
-
-        listings = [extract_listing(item) for item in items]
-        if hood_name:
-            for l in listings:
-                if not l.get("neighborhood"):
-                    l["neighborhood"] = hood_name
-        upsert_listings(conn, listings)
-        total += len(items)
-
-        if len(items) < BATCH_SIZE:
-            break
-
-        skip += BATCH_SIZE
+        new_count = 0
+        for item in items:
+            cid = item.get("coreListingId")
+            if cid not in seen:
+                seen[cid] = item
+                new_count += 1
+        if new_count == 0:
+            break  # API is recycling
         time.sleep(DELAY)
-
-    return total
-
-
-def probe_exceeds_limit(status, listing_type, place=None, bedrooms=None,
-                        price_min=None, price_max=None):
-    """Single request to check if a query has more than 5K results."""
-    filt = build_filter(status, listing_type, place, bedrooms, price_min, price_max)
-    filt["skip"] = MAX_SKIP
-    filt["take"] = 1
-    payload = {"filter": filt, "map": {"zoomLevel": 11, "geometry": None}}
-    data = api_post("/listing/filter", payload, label="probe")
-    if not data:
-        return False
-    items = data.get("listings", [])
-    time.sleep(DELAY)
-    return len(items) > 0
+    return seen
 
 
 def make_place(p):
@@ -559,120 +533,132 @@ def mark_done(conn, query_type, partition, results_count):
 
 
 def exhaustive_pull(conn, status, listing_type, place, label, is_rental=True,
-                    category_label="", hood_name=None):
-    """
-    Pull all listings for a place, with automatic sub-partitioning.
-    Uses probe-first to skip redundant full fetches of dense buckets.
-    Checkpoints each bedroom partition so restarts skip completed work.
-    """
-    # Check if this entire neighborhood is already done
+                    category_label=""):
+    """Pull all listings for a place. Automatically splits by bedroom then
+    price when the API's ~300 result cap is hit."""
+
     if is_done(conn, category_label, label):
         tprint(f"  [{label}] SKIP (already completed)")
         return 0
 
-    # Probe: does this neighborhood exceed 5K?
-    exceeds = probe_exceeds_limit(status, listing_type, place=place)
+    # Try unsplit first
+    results = paginate_unique(status, listing_type, place=place)
 
-    if not exceeds:
-        # Under 5K — just paginate the whole thing
-        count = paginate_query(conn, status, listing_type, place=place, label=label,
-                              hood_name=hood_name)
-        tprint(f"  [{label}] : {count}")
-        mark_done(conn, category_label, label, count)
-        return count
+    if len(results) < RESULT_CAP:
+        listings = [extract_listing(it) for it in results.values()]
+        upsert_listings(conn, listings)
+        tprint(f"  [{label}] {len(results)}")
+        mark_done(conn, category_label, label, len(results))
+        return len(results)
 
-    # Over 5K — skip straight to bedroom partitioning (don't waste 50 requests on L1)
-    tprint(f"  [{label}] >5K, splitting by bedrooms...")
-    total = 0
+    # Hit cap — split by bedrooms
+    tprint(f"  [{label}] {len(results)} (capped), splitting by bedroom...")
+    all_items = {}
 
     for beds in BEDROOM_VALUES:
         bed_label = f"{label}/{beds}BR"
 
         if is_done(conn, category_label, bed_label):
-            tprint(f"    [{bed_label}] SKIP (already completed)")
+            tprint(f"    [{bed_label}] SKIP (done)")
             continue
 
-        # Probe this bedroom
-        bed_exceeds = probe_exceeds_limit(status, listing_type, place=place, bedrooms=beds)
+        bed_results = paginate_unique(status, listing_type, place=place, bedrooms=beds)
 
-        if not bed_exceeds:
-            # Under 5K — paginate normally
-            bed_count = paginate_query(conn, status, listing_type, place=place,
-                                       bedrooms=beds, label=bed_label,
-                                       hood_name=hood_name)
-            tprint(f"    [{bed_label}] : {bed_count}")
+        if len(bed_results) < RESULT_CAP:
+            all_items.update(bed_results)
+            listings = [extract_listing(it) for it in bed_results.values()]
+            upsert_listings(conn, listings)
+            tprint(f"    [{bed_label}] {len(bed_results)}")
+            mark_done(conn, category_label, bed_label, len(bed_results))
         else:
-            # Over 5K — skip straight to price splitting
-            tprint(f"    [{bed_label}] >5K, splitting by price...")
-            if is_rental:
-                initial_ranges = [(None, 1500), (1500, 3000), (3000, 5000), (5000, 10000), (10000, None)]
-            else:
-                initial_ranges = [(None, 500000), (500000, 1000000), (1000000, 2000000),
-                                  (2000000, 5000000), (5000000, None)]
-
-            bed_count = _recursive_price_pull(
-                conn, status, listing_type, place, beds, initial_ranges,
-                bed_label, is_rental, depth=0, hood_name=hood_name
+            # Hit cap — split by price
+            tprint(f"    [{bed_label}] {len(bed_results)} (capped), splitting by price...")
+            price_ranges = _initial_price_ranges(is_rental)
+            bed_items = _price_split_pull(
+                conn, status, listing_type, place, beds, price_ranges,
+                bed_label, is_rental, category_label
             )
+            all_items.update(bed_items)
+            mark_done(conn, category_label, bed_label, len(bed_items))
 
-        total += bed_count
-        mark_done(conn, category_label, bed_label, bed_count)
+    # Also upsert the initial unsplit results (may have IDs not in any bedroom bucket)
+    all_items.update(results)
+    listings = [extract_listing(it) for it in results.values()]
+    upsert_listings(conn, listings)
 
+    total = len(all_items)
     mark_done(conn, category_label, label, total)
+    tprint(f"  [{label}] TOTAL: {total}")
     return total
 
 
-def _recursive_price_pull(conn, status, listing_type, place, beds, price_ranges,
-                          parent_label, is_rental, depth, hood_name=None):
-    """Recursively split price ranges until each bucket fits under 5K.
-    Uses probe-first to avoid fetching 5K records from dense buckets."""
-    total = 0
+def _initial_price_ranges(is_rental):
+    if is_rental:
+        return [(None, 1500), (1500, 2000), (2000, 2500), (2500, 3000),
+                (3000, 3500), (3500, 4000), (4000, 5000), (5000, 7000),
+                (7000, 10000), (10000, 15000), (15000, None)]
+    else:
+        return [(None, 500000), (500000, 750000), (750000, 1000000),
+                (1000000, 1500000), (1500000, 2000000), (2000000, 3000000),
+                (3000000, 5000000), (5000000, 10000000), (10000000, None)]
+
+
+def _price_split_pull(conn, status, listing_type, place, beds, price_ranges,
+                      parent_label, is_rental, category_label, depth=0):
+    """Recursively split price ranges until each bucket is under the cap."""
+    all_items = {}
     indent = "      " + "  " * depth
 
     for pmin, pmax in price_ranges:
         price_label = f"{parent_label}/${pmin or 0}-{pmax or 'max'}"
 
-        # Probe first: does this price range exceed 5K?
-        exceeds = probe_exceeds_limit(status, listing_type, place=place,
-                                       bedrooms=beds, price_min=pmin, price_max=pmax)
+        if is_done(conn, category_label, price_label):
+            tprint(f"{indent}[{price_label}] SKIP (done)")
+            continue
 
-        if not exceeds:
-            # Under 5K — paginate normally
-            p_count = paginate_query(conn, status, listing_type, place=place,
-                                     bedrooms=beds, price_min=pmin, price_max=pmax,
-                                     label=price_label, hood_name=hood_name)
-            tprint(f"{indent}[{price_label}] : {p_count}")
-            total += p_count
+        results = paginate_unique(status, listing_type, place=place,
+                                  bedrooms=beds, price_min=pmin, price_max=pmax)
+
+        if len(results) < RESULT_CAP:
+            # Got everything
+            listings = [extract_listing(it) for it in results.values()]
+            upsert_listings(conn, listings)
+            all_items.update(results)
+            tprint(f"{indent}[{price_label}] {len(results)}")
+            mark_done(conn, category_label, price_label, len(results))
         else:
-            # Over 5K — try to split further
+            # Still capped — split further
             lo = pmin or 0
             hi = pmax
             if hi is None:
-                hi = lo * 3 if lo > 0 else 50000 if is_rental else 20000000
-            if hi - lo >= (100 if is_rental else 50000):
+                hi = lo * 3 if lo > 0 else (50000 if is_rental else 20000000)
+            if hi - lo >= (50 if is_rental else 10000):
                 mid = (lo + hi) // 2
-                sub_ranges = [(pmin, mid), (mid, pmax)]
-                tprint(f"{indent}[{price_label}] >5K, splitting → {lo}-{mid} / {mid}-{pmax or 'max'}")
-                total += _recursive_price_pull(
-                    conn, status, listing_type, place, beds, sub_ranges,
-                    parent_label, is_rental, depth + 1, hood_name=hood_name
+                tprint(f"{indent}[{price_label}] {len(results)} (capped), split → {lo}-{mid} / {mid}-{pmax or 'max'}")
+                sub = _price_split_pull(
+                    conn, status, listing_type, place, beds,
+                    [(pmin, mid), (mid, pmax)],
+                    parent_label, is_rental, category_label, depth + 1
                 )
+                all_items.update(sub)
+                # Also save the capped results (may contain IDs not in sub-splits)
+                listings = [extract_listing(it) for it in results.values()]
+                upsert_listings(conn, listings)
+                all_items.update(results)
             else:
-                # Range too narrow to split, try reverse ordering
-                rev_label = f"{price_label}/oldest"
-                rev_count = paginate_query(conn, status, listing_type, place=place,
-                                           bedrooms=beds, price_min=pmin, price_max=pmax,
-                                           label=rev_label, order_by="Oldest",
-                                           hood_name=hood_name)
-                tprint(f"{indent}  [{rev_label}] reverse: {rev_count}")
-                total += rev_count
+                # Can't split further — save what we have
+                listings = [extract_listing(it) for it in results.values()]
+                upsert_listings(conn, listings)
+                all_items.update(results)
+                tprint(f"{indent}[{price_label}] {len(results)} (capped, min range)")
+            mark_done(conn, category_label, price_label, len(results))
 
-    return total
+    return all_items
 
 
 # ── Main pull orchestration ─────────────────────────────────
 
-def pull_category(conn, status, listing_type, category_label):
+def pull_category(conn, status, listing_type, category_label, borough_filter=None):
     is_rental = "Lease" in listing_type
     tprint(f"\n{'='*60}")
     tprint(f"  {category_label} ({status} / {listing_type})")
@@ -682,68 +668,20 @@ def pull_category(conn, status, listing_type, category_label):
     grand_total = 0
 
     for borough in NYC_BOROUGHS:
+        if borough_filter and borough["name"] != borough_filter:
+            continue
         place = make_place(borough)
         borough_label = f"{category_label}/{borough['name']}"
 
-        # Check if entire borough is already done
-        if is_done(conn, category_label, borough_label):
-            tprint(f"  [{borough['name']}] SKIP (already completed)")
-            continue
-
-        # Probe: does this borough exceed 5K?
-        exceeds = probe_exceeds_limit(status, listing_type, place=place)
-
-        if not exceeds:
-            # Under 5K — just paginate the whole borough
-            count = paginate_query(conn, status, listing_type, place=place, label=borough_label)
-            tprint(f"  [{borough['name']}] borough-level: {count}")
-            grand_total += count
-            mark_done(conn, category_label, borough_label, count)
-            continue
-
-        # Over 5K — sub-partition by neighborhood
-        hoods = BOROUGH_HOODS.get(borough["name"], [])
-        if not hoods:
-            # For boroughs without defined neighborhoods, split by beds+price at borough level
-            tprint(f"  [{borough['name']}] no neighborhoods defined, splitting by beds+price...")
-            grand_total += exhaustive_pull(conn, status, listing_type, place,
-                                           borough_label, is_rental,
-                                           category_label=category_label) - count
-            mark_done(conn, category_label, borough_label, grand_total)
-            continue
-
-        tprint(f"  [{borough['name']}] hit limit, partitioning into {len(hoods)} neighborhoods ({NUM_WORKERS} workers)...")
-
-        def _pull_hood(hood):
-            """Worker function — runs in thread pool with own DB connection."""
-            tc = thread_conn()
-            hood_place = make_place(hood)
-            hood_label = f"{category_label}/{hood['name']}"
-            try:
-                count = exhaustive_pull(tc, status, listing_type, hood_place,
-                                        hood_label, is_rental,
-                                        category_label=category_label,
-                                        hood_name=hood['name'])
-                return hood['name'], count
-            finally:
-                tc.close()
-
-        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-            futures = {executor.submit(_pull_hood, hood): hood for hood in hoods}
-            for future in as_completed(futures):
-                hood = futures[future]
-                try:
-                    name, count = future.result()
-                    grand_total += count
-                except Exception as e:
-                    tprint(f"  [ERROR] {hood['name']}: {e}")
-
-        mark_done(conn, category_label, borough_label, grand_total)
+        borough_count = exhaustive_pull(conn, status, listing_type, place,
+                                        borough_label, is_rental,
+                                        category_label=category_label)
+        grand_total += borough_count
 
     count_after = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
     new_records = count_after - count_before
 
-    tprint(f"\n  [{category_label}] DONE — {grand_total:,} fetched, {new_records:,} new unique records")
+    tprint(f"\n  [{category_label}] DONE — {new_records:,} new unique records")
     return new_records
 
 
@@ -887,6 +825,8 @@ def main():
     parser.add_argument("--active-only", action="store_true")
     parser.add_argument("--details", action="store_true")
     parser.add_argument("--details-limit", type=int)
+    parser.add_argument("--manhattan-only", action="store_true",
+                        help="Only pull Manhattan listings")
     parser.add_argument("--backfill-hoods", action="store_true",
                         help="Backfill neighborhood names for existing listings")
     args = parser.parse_args()
@@ -911,21 +851,30 @@ def main():
         return
 
     pull_all = not (args.rentals_only or args.sales_only or args.active_only)
+    borough_filter = "Manhattan" if args.manhattan_only else None
     totals = {}
 
     if pull_all or args.rentals_only:
         totals["closed_rentals"] = pull_category(
-            conn, "Closed", "ResidentialLease", "Closed Rentals")
+            conn, "Closed", "ResidentialLease", "Closed Rentals", borough_filter)
 
     if pull_all or args.sales_only:
         totals["closed_sales"] = pull_category(
-            conn, "Closed", "ResidentialSale", "Closed Sales")
+            conn, "Closed", "ResidentialSale", "Closed Sales", borough_filter)
 
     if pull_all or args.active_only:
         totals["active_rentals"] = pull_category(
-            conn, "Active", "ResidentialLease", "Active Rentals")
+            conn, "Active", "ResidentialLease", "Active Rentals", borough_filter)
         totals["active_sales"] = pull_category(
-            conn, "Active", "ResidentialSale", "Active Sales")
+            conn, "Active", "ResidentialSale", "Active Sales", borough_filter)
+        totals["under_contract_rentals"] = pull_category(
+            conn, "ActiveUnderContract", "ResidentialLease", "UnderContract Rentals", borough_filter)
+        totals["under_contract_sales"] = pull_category(
+            conn, "ActiveUnderContract", "ResidentialSale", "UnderContract Sales", borough_filter)
+        totals["pending_rentals"] = pull_category(
+            conn, "Pending", "ResidentialLease", "Pending Rentals", borough_filter)
+        totals["pending_sales"] = pull_category(
+            conn, "Pending", "ResidentialSale", "Pending Sales", borough_filter)
 
     tprint(f"\n{'='*60}")
     tprint("PULL COMPLETE")
