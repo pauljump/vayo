@@ -816,6 +816,67 @@ def backfill_neighborhoods(conn):
     tprint(f"\nBackfill complete. Tagged {total_updated} listings.")
 
 
+def _show_status(conn):
+    """Show current pull progress."""
+    total = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    detailed = conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE detail_fetched=1").fetchone()[0]
+
+    tprint(f"\n{'='*60}")
+    tprint(f"  ELLIMAN PULL STATUS")
+    tprint(f"{'='*60}")
+    tprint(f"  DB: {DB_PATH}")
+    tprint(f"  DB size: {DB_PATH.stat().st_size / 1024 / 1024:.1f} MB")
+    tprint(f"\n  Total listings: {total:,}")
+    tprint(f"  With details: {detailed:,}")
+
+    tprint(f"\n  By status/type:")
+    for row in conn.execute(
+        "SELECT listing_status, listing_type, COUNT(*) FROM listings "
+        "GROUP BY listing_status, listing_type ORDER BY COUNT(*) DESC"
+    ).fetchall():
+        tprint(f"    {row[0]}/{row[1]}: {row[2]:,}")
+
+    tprint(f"\n  By borough:")
+    for row in conn.execute(
+        "SELECT borough, COUNT(*) FROM listings GROUP BY borough ORDER BY COUNT(*) DESC"
+    ).fetchall():
+        tprint(f"    {row[0] or '?'}: {row[1]:,}")
+
+    tprint(f"\n  Completed partitions:")
+    for row in conn.execute(
+        "SELECT query_type, partition, results_count FROM pull_log ORDER BY id"
+    ).fetchall():
+        tprint(f"    [{row[0]}] {row[1]}: {row[2]:,}")
+
+    # Show remaining
+    tprint(f"\n  Remaining work:")
+    remaining = []
+    categories = [
+        ("Closed", "ResidentialLease", "Closed Rentals"),
+        ("Closed", "ResidentialSale", "Closed Sales"),
+        ("Active", "ResidentialLease", "Active Rentals"),
+        ("Active", "ResidentialSale", "Active Sales"),
+        ("ActiveUnderContract", "ResidentialLease", "UnderContract Rentals"),
+        ("ActiveUnderContract", "ResidentialSale", "UnderContract Sales"),
+        ("Pending", "ResidentialLease", "Pending Rentals"),
+        ("Pending", "ResidentialSale", "Pending Sales"),
+    ]
+    for _, _, label in categories:
+        for borough in NYC_BOROUGHS:
+            partition = f"{label}/{borough['name']}"
+            if not is_done(conn, label, partition):
+                remaining.append(partition)
+
+    if remaining:
+        for r in remaining[:20]:
+            tprint(f"    TODO: {r}")
+        if len(remaining) > 20:
+            tprint(f"    ... and {len(remaining) - 20} more")
+    else:
+        tprint(f"    All search partitions complete!")
+
+
 # ── Main ────────────────────────────────────────────────────
 
 def main():
@@ -829,9 +890,16 @@ def main():
                         help="Only pull Manhattan listings")
     parser.add_argument("--backfill-hoods", action="store_true",
                         help="Backfill neighborhood names for existing listings")
+    parser.add_argument("--status", action="store_true",
+                        help="Show pull progress and exit")
     args = parser.parse_args()
 
     conn = init_db()
+
+    if args.status:
+        _show_status(conn)
+        conn.close()
+        return
 
     tprint("Testing API connectivity...")
     test = api_get("/listing/search-options", label="test")

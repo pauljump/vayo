@@ -1,98 +1,148 @@
 # vayo - Current State
 
 **Last updated:** 2026-02-19
-**Sessions:** ~10+
-**Readiness:** 45%
+**Sessions:** ~12+
+**Readiness:** 50%
 
 ## Goal
 Build a "Zillow meets Bloomberg Terminal" apartment finder that uses public data transparency to surface hidden gems and predict availability before listings go live.
 
-## Status
-Elliman MLS puller rebuilt with correct methodology. Gramercy proof-of-concept complete: 4,895 listings (2,237 closed rentals, 2,426 closed sales, 9 active rentals, 144 active sales, 84 pending/under-contract). Next: cross-reference StreetEasy listings against Elliman/other APIs.
+## Data Pipeline Architecture
 
-## Elliman MLS Puller — `scripts/pull_elliman_mls.py`
-
-### Methodology (validated 2026-02-19)
-- **API:** `core.api.elliman.com` — Trestle/CoreLogic MLS feed, no API key needed
-- **Auth:** Trivially obfuscated timestamp header (base64 + char shift)
-- **Result cap:** API returns max ~300 unique results per query, then recycles
-- **Partitioning strategy:**
-  1. Query a bucket → paginate until no new unique IDs appear
-  2. If 300 unique (capped) → split by bedroom (0-5BR)
-  3. If still 300 → split by price range, recurse with tighter ranges
-  4. Under 300 = complete dataset for that bucket
-- **Statuses pulled:** Closed, Active, ActiveUnderContract, Pending
-- **Listing types:** ResidentialLease, ResidentialSale
-- **Checkpointing:** Every partition logged in `pull_log` table for resumability
-
-### Key findings
-- **Neighborhood IDs are unreliable** — most Manhattan IDs map to wrong neighborhoods. Only ~8 of 28 are correct. Brooklyn IDs don't work at all.
-- **Gramercy (id=153791) verified correct** — returns E 20th, 3rd Ave, E 22nd addresses
-- **homeType filter corrupts listingType** — setting homeTypes overrides the rental/sale filter. DO NOT use.
-- **API recycles results** — probe at skip=4999 always returns data (recycled), making the old >5K probe unreliable
-- **Borough-level pulls hit 300 cap even at $31 price ranges** — neighborhood-level filtering essential for complete data
-
-### Verified working neighborhood IDs (Manhattan)
-- Chelsea (153783), East Village (153787), Gramercy (153791)
-- SoHo (153813), TriBeCa (153818), UES (153820), UWS (153821)
-- Washington Heights (153822)
-
-### Broken/wrong IDs (need remapping)
-- West Village: 153823→153792, Battery Park City: 153779→153780, Flatiron: 153790→153808
-- Yorkville, Alphabet City: no separate IDs (covered by UES, East Village)
-- Many others scrambled (Greenwich Village ID returns Hamilton Heights, etc.)
-
-### Usage
-```bash
-python3 scripts/pull_elliman_mls.py                    # pull everything, all boroughs
-python3 scripts/pull_elliman_mls.py --manhattan-only   # Manhattan only
-python3 scripts/pull_elliman_mls.py --rentals-only     # closed rentals only
-python3 scripts/pull_elliman_mls.py --active-only      # active + under-contract + pending
-python3 scripts/pull_elliman_mls.py --details          # fetch full listing details
+```
+Brokerage APIs (Elliman, Corcoran)     StreetEasy (Wayback + Direct)     ACRIS (NYC Public)
+         ↓                                        ↓                           ↓
+   elliman_mls.db                           se_listings.db               vayo_clean.db
+   corcoran.db                                                          (8.4 GB, 49M records)
+         ↓                                        ↓                           ↓
+         └──────────────────────┬──────────────────┘                          │
+                                ↓                                             │
+                    Unified Listings DB  ←────────────────────────────────────┘
+                    (address/BBL matching)
+                                ↓
+                    Web Dashboard + Analytics
 ```
 
-## What Needs to Resume
+## Brokerage API Pullers
 
-### ACRIS Parties Pull (partitioned)
+### Elliman MLS — `scripts/pull_elliman_mls.py` → `elliman_mls.db`
+
+**API:** `core.api.elliman.com` (Trestle/CoreLogic REBNY feed, no API key)
+**Auth:** Obfuscated timestamp header (base64 + char shift)
+
+**Methodology (validated 2026-02-19):**
+- API returns max ~300 unique results per query, then recycles
+- Partition: query → if 300 (capped) → split by bedroom → split by price → recurse
+- Under 300 = complete for that bucket
+- Statuses: Closed, Active, ActiveUnderContract, Pending
+- Types: ResidentialLease, ResidentialSale
+- Partitioned by borough, checkpointed at every level
+
+**Current data:** Gramercy proof-of-concept (4,895 listings)
+**Target:** All NYC (~unknown total, need to discover)
+
+**Usage:**
+```bash
+python3 scripts/pull_elliman_mls.py                    # all NYC
+python3 scripts/pull_elliman_mls.py --manhattan-only   # Manhattan only
+python3 scripts/pull_elliman_mls.py --status           # show progress
+```
+
+### Corcoran — `scripts/pull_corcoran.py` → `corcoran.db`
+
+**API:** `backendapi.corcoranlabs.com` (Realogy/Anywhere "NewTaxi" backend)
+**Auth:** `be-api-key: 667256B5BF6ABFF6C8BDC68E88226` (hardcoded in their JS)
+
+**Methodology:**
+- Standard REST pagination (100/page, deterministic price+asc sort)
+- Search by listingStatus: Active, Sold, Rented, Expired
+- Search by transactionType: for-rent, for-sale
+- Borough-level partitioning via `citiesOrBoroughs` filter
+- Detail endpoint (`/api/listings/{id}`) returns 138 fields including:
+  - `listingHistories`: full building transaction history (sold prices, dates, sqft)
+  - `building`: 40-key dict (floors, units, year built, amenities)
+  - `closeSubways`: nearby transit with distances
+- All raw JSON preserved in `detail_json` column
+- Concurrent detail fetching (4 workers default, configurable)
+
+**NYC totals:**
+- Active: 4,086
+- Sold: 319,493
+- Rented: 356,733
+- Expired: 17,348
+- **Total: 697,660**
+
+**Current data:** Gramercy complete (12,826 listings + details in progress)
+**Target:** All NYC (697K search + details)
+
+**Usage:**
+```bash
+python3 scripts/pull_corcoran.py                       # all NYC
+python3 scripts/pull_corcoran.py --manhattan-only      # Manhattan only
+python3 scripts/pull_corcoran.py --details-only        # just fetch details
+python3 scripts/pull_corcoran.py --details-workers 8   # faster detail fetch
+python3 scripts/pull_corcoran.py --status              # show progress
+```
+
+### Other Brokerages Investigated
+
+| Brokerage | API? | Worth building? |
+|-----------|------|-----------------|
+| Compass | Partial (similarhomes API, Googlebot SSR) | Yes, later — 25-40K NYC exclusive rentals via sitemap |
+| C21/CB/BHGRE/ERA | Shared API, key in JS | No — ~80 NYC rentals total |
+| Brown Harris Stevens | Cloudflare-locked | No direct API access |
+| Nest Seekers | GraphQL schema exposed | Listings need auth |
+| Sotheby's | AWS WAF locked | No access |
+
+## StreetEasy Scraping
+
+### Wayback Machine Pipeline — `scripts/streeteasy_wayback_history.py`
+- 3-phase: CDX index → queue → fetch
+- ~190K of 944K buildings covered by Wayback
+- Overnight loop: `scripts/run_wayback_overnight.sh`
+
+### Direct Scraper — `scripts/se_fast_scrape.py`
+- tls-client with Chrome cookies, bypasses PerimeterX
+- Progress: 7,304 / 943,790 buildings (~0.8%)
+- VPS + residential proxy planned for full scrape
+
+## ACRIS (NYC Public Records)
+- Master: 16.9M documents (done)
+- Legals: ~14.7M (done)
+- Parties: ~70% done
+- `scripts/pull_acris_partitioned.py --parties-only`
+
+## What to Resume
+
+### Priority 1: Brokerage Full Pulls
+```bash
+# Corcoran — full NYC (search ~26min, details ~10hrs with 4 workers)
+python3 scripts/pull_corcoran.py
+
+# Elliman — full NYC (slower due to 300-cap splitting)
+python3 scripts/pull_elliman_mls.py
+```
+
+### Priority 2: StreetEasy Integration
+- Cross-reference brokerage data with SE listings
+- Build boutique brokerage catalog (tag small brokerages from SE)
+- Resume direct SE scraping for complete coverage
+
+### Priority 3: ACRIS Parties
 ```bash
 python3 scripts/pull_acris_partitioned.py --parties-only
 ```
-- **Progress:** ~70% done. Legals complete.
-- **Cache dir:** `acris_cache/full/parties_parts/`
-
-### StreetEasy Fast Scraper
-```bash
-python3 scripts/se_fast_scrape.py --from-sitemap --delay 1.0
-```
-- **Progress:** 7,304 / 943,790 buildings (~0.8%)
 
 ## Databases
-
-### `elliman_mls.db` — Elliman/MLS listing data
-- Currently: Gramercy proof-of-concept (4,895 listings)
-- Schema: listings table with 46 columns (address, price, beds, baths, sqft, agents, etc.)
-- pull_log table for checkpoint/resume
-
-### `vayo_clean.db` (8.4 GB) — Main operational database
-All tables keyed on BBL integer with proper indexes. 14+ tables, ~49M records.
-
-### `se_listings.db` — StreetEasy scraped data
-Buildings, units, price history from Wayback + direct scraping.
-
-## Next Steps
-1. Cross-reference StreetEasy Gramercy listings against Elliman API and other sources
-2. Fix remaining Manhattan neighborhood ID mappings
-3. Pull all Manhattan neighborhoods through Elliman
-4. Complete ACRIS parties pull
-5. Rebuild vayo_clean.db with full ACRIS + Elliman data
+- `elliman_mls.db` — Elliman/REBNY MLS data
+- `corcoran.db` — Corcoran data (active + sold + rented + expired + details)
+- `vayo_clean.db` (8.4 GB) — Main DB, all tables keyed on BBL
+- `se_listings.db` — StreetEasy scraped data
 
 ## Key Files
-- `elliman_mls.db` — Elliman/MLS data (NEW)
-- `vayo_clean.db` — Main database
-- `se_listings.db` — StreetEasy data
-- `scripts/pull_elliman_mls.py` — Elliman MLS puller (REWRITTEN)
-- `scripts/se_fast_scrape.py` — High-speed browserless SE scraper
-- `scripts/scrape_streeteasy.py` — Browser-based SE scraper
-- `scripts/pull_acris_partitioned.py` — Fast partitioned ACRIS puller
+- `scripts/pull_elliman_mls.py` — Elliman MLS puller
+- `scripts/pull_corcoran.py` — Corcoran puller (NEW)
+- `scripts/se_fast_scrape.py` — StreetEasy direct scraper
+- `scripts/streeteasy_wayback_history.py` — Wayback pipeline
+- `scripts/pull_acris_partitioned.py` — ACRIS puller
 - `scripts/build_clean_db.py` — Builds vayo_clean.db
-- `se_sitemaps/all_buildings.txt` — 943K SE building slugs
