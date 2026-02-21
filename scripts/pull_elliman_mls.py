@@ -46,6 +46,7 @@ MAX_SKIP = 4999
 DELAY = 0.15  # seconds between requests (was 0.4)
 HIT_LIMIT = 4900  # if we get this many, assume there's more beyond 5K
 NUM_WORKERS = 4  # concurrent neighborhood workers
+HOOD_WORKERS = 4  # concurrent neighborhood pulls within a borough
 
 API_BASE = "https://core.api.elliman.com"
 
@@ -293,9 +294,12 @@ BROOKLYN_HOODS = [
     {"name": "Sheepshead Bay", "id": 153759, "urlKey": "sheepshead-bay-brooklyn-ny"},
 ]
 
-# Neighborhood-level IDs are unreliable (most map to wrong areas).
-# All boroughs use borough-level bedroom+price partitioning instead.
-BOROUGH_HOODS = {}
+# Neighborhoods for sub-partitioning large boroughs.
+# Keeps each query under the 300-result cap with fewer recursive splits.
+BOROUGH_HOODS = {
+    "Manhattan": MANHATTAN_HOODS,
+    "Brooklyn": BROOKLYN_HOODS,
+}
 
 # ── Price range partitions for sub-splitting ────────────────
 
@@ -331,6 +335,68 @@ RESULT_CAP = 300  # API recycles results after this many unique IDs
 BEDROOM_VALUES = [0, 1, 2, 3, 4, 5]  # 5 = 5+
 
 
+# ── City-to-Borough mapping ─────────────────────────────────
+
+# Comprehensive mapping of city/neighborhood names to NYC boroughs.
+# Covers all known variants from the Elliman MLS API.
+_CITY_BOROUGH_MAP = {
+    # Manhattan
+    "new york": "Manhattan", "manhattan": "Manhattan", "inwood": "Manhattan",
+    # Brooklyn
+    "brooklyn": "Brooklyn", "east new york": "Brooklyn", "crown heights": "Brooklyn",
+    "bed-stuy": "Brooklyn", "east flatbush": "Brooklyn", "canarsie": "Brooklyn",
+    "brownsville": "Brooklyn", "sheepshead bay": "Brooklyn",
+    "downtown brooklyn": "Brooklyn", "sunset park": "Brooklyn", "midwood": "Brooklyn",
+    "gravesend": "Brooklyn", "cypress hills": "Brooklyn", "bushwick": "Brooklyn",
+    "greenpoint": "Brooklyn", "flatlands": "Brooklyn", "flatbush": "Brooklyn",
+    "bergen beach": "Brooklyn", "windsor terrace": "Brooklyn",
+    "williamsburg": "Brooklyn", "stuyvesant hts": "Brooklyn",
+    "prospect heights": "Brooklyn", "kensington (brooklyn)": "Brooklyn",
+    "marine park": "Brooklyn", "coney island": "Brooklyn", "cobble hill": "Brooklyn",
+    "clinton hill": "Brooklyn", "city line": "Brooklyn", "brighton beach": "Brooklyn",
+    "bay ridge": "Brooklyn", "old mill basin": "Brooklyn",
+    # Queens
+    "queens": "Queens", "flushing": "Queens", "bayside": "Queens",
+    "jamaica": "Queens", "forest hills": "Queens", "rego park": "Queens",
+    "whitestone": "Queens", "queens village": "Queens", "woodside": "Queens",
+    "astoria": "Queens", "fresh meadows": "Queens", "howard beach": "Queens",
+    "jackson heights": "Queens", "floral park": "Queens", "kew gardens": "Queens",
+    "east elmhurst": "Queens", "elmhurst": "Queens", "middle village": "Queens",
+    "saint albans": "Queens", "little neck": "Queens", "ozone park": "Queens",
+    "bellerose": "Queens", "glendale": "Queens", "douglaston": "Queens",
+    "woodhaven": "Queens", "rosedale": "Queens", "maspeth": "Queens",
+    "corona": "Queens", "south ozone park": "Queens", "college point": "Queens",
+    "glen oaks": "Queens", "briarwood": "Queens", "far rockaway": "Queens",
+    "springfield gardens": "Queens", "long island city": "Queens",
+    "cambria heights": "Queens", "oakland gardens": "Queens",
+    "kew garden hills": "Queens", "laurelton": "Queens", "ridgewood": "Queens",
+    "beechhurst": "Queens", "richmond hill": "Queens", "hollis": "Queens",
+    "sunnyside": "Queens", "jamaica estates": "Queens",
+    "richmond hill s.": "Queens", "arverne": "Queens", "rockaway park": "Queens",
+    "rockaway beach": "Queens", "hollis hills": "Queens", "jamaica hills": "Queens",
+    "broad channel": "Queens", "holliswood": "Queens", "malba": "Queens",
+    "belle harbor": "Queens", "neponsit": "Queens", "hillcrest": "Queens",
+    "bellerose manor": "Queens", "addisleigh park": "Queens",
+    "richmond hill north": "Queens", "lindenwood": "Queens",
+    "queens village south": "Queens", "queens village north": "Queens",
+    "rochdale": "Queens", "edgemere": "Queens", "breezy point": "Queens",
+    "bayswater": "Queens", "hamilton beach": "Queens",
+    "hillcrest (queens)": "Queens", "harbor hills": "Queens",
+    "jamaica south": "Queens",
+    # Bronx
+    "bronx": "Bronx", "the bronx": "Bronx", "wakefield": "Bronx",
+    # Staten Island
+    "staten island": "Staten Island",
+}
+
+
+def _city_to_borough(city):
+    """Map a city/neighborhood name to its NYC borough, or None if not in NYC."""
+    if not city:
+        return None
+    return _CITY_BOROUGH_MAP.get(city.lower().strip())
+
+
 # ── Extraction ──────────────────────────────────────────────
 
 def extract_listing(item):
@@ -352,21 +418,9 @@ def extract_listing(item):
         if m:
             zip_code = m.group(1)
 
-    borough = None
     city = addr.get("city", "")
     state = addr.get("stateOrProvince", "")
-    if state == "NY":
-        cl = (city or "").lower()
-        if cl in ("new york", "manhattan"):
-            borough = "Manhattan"
-        elif cl == "brooklyn":
-            borough = "Brooklyn"
-        elif cl == "queens":
-            borough = "Queens"
-        elif cl in ("bronx", "the bronx"):
-            borough = "Bronx"
-        elif cl == "staten island":
-            borough = "Staten Island"
+    borough = _city_to_borough(city)
 
     features = item.get("features", []) or []
 
@@ -658,6 +712,21 @@ def _price_split_pull(conn, status, listing_type, place, beds, price_ranges,
 
 # ── Main pull orchestration ─────────────────────────────────
 
+def _pull_hood_worker(status, listing_type, hood, borough_name, is_rental,
+                      category_label):
+    """Worker function for concurrent neighborhood pulls. Uses own DB connection."""
+    tc = thread_conn()
+    hood_label = f"{category_label}/{borough_name}/{hood['name']}"
+    hood_place = make_place(hood)
+    try:
+        count = exhaustive_pull(tc, status, listing_type, hood_place,
+                                hood_label, is_rental,
+                                category_label=category_label)
+        return (hood["name"], count)
+    finally:
+        tc.close()
+
+
 def pull_category(conn, status, listing_type, category_label, borough_filter=None):
     is_rental = "Lease" in listing_type
     tprint(f"\n{'='*60}")
@@ -672,10 +741,34 @@ def pull_category(conn, status, listing_type, category_label, borough_filter=Non
             continue
         place = make_place(borough)
         borough_label = f"{category_label}/{borough['name']}"
+        borough_count = 0
 
-        borough_count = exhaustive_pull(conn, status, listing_type, place,
-                                        borough_label, is_rental,
-                                        category_label=category_label)
+        hoods = BOROUGH_HOODS.get(borough["name"])
+        if hoods:
+            # Concurrent neighborhood-level partitioning
+            with ThreadPoolExecutor(max_workers=HOOD_WORKERS) as executor:
+                futures = {
+                    executor.submit(
+                        _pull_hood_worker, status, listing_type, hood,
+                        borough["name"], is_rental, category_label
+                    ): hood["name"]
+                    for hood in hoods
+                }
+                for future in as_completed(futures):
+                    hood_name, count = future.result()
+                    borough_count += count
+
+            # Sweep borough-level to catch listings in unlisted neighborhoods
+            sweep_label = f"{category_label}/{borough['name']}/_sweep"
+            sweep_count = exhaustive_pull(conn, status, listing_type, place,
+                                          sweep_label, is_rental,
+                                          category_label=category_label)
+            borough_count += sweep_count
+        else:
+            borough_count = exhaustive_pull(conn, status, listing_type, place,
+                                            borough_label, is_rental,
+                                            category_label=category_label)
+
         grand_total += borough_count
 
     count_after = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
@@ -687,6 +780,110 @@ def pull_category(conn, status, listing_type, category_label, borough_filter=Non
 
 # ── Detail fetcher ──────────────────────────────────────────
 
+def _extract_detail_updates(data):
+    """Extract all updatable fields from a detail API response."""
+    updates = {"detail_fetched": 1}
+    addr = data.get("address", {}) or {}
+    if addr.get("neighborhood"):
+        updates["neighborhood"] = addr["neighborhood"]
+    if addr.get("postalCode"):
+        updates["zip"] = addr["postalCode"]
+    lat = (data.get("latLng") or {}).get("lat")
+    lng = (data.get("latLng") or {}).get("lng")
+    if lat:
+        updates["latitude"] = lat
+    if lng:
+        updates["longitude"] = lng
+    if data.get("yearBuilt"):
+        updates["year_built"] = data["yearBuilt"]
+    if data.get("buildingName"):
+        updates["building_name"] = data["buildingName"]
+    if data.get("stories"):
+        updates["stories"] = data["stories"]
+    if data.get("numberOfUnits"):
+        updates["num_units"] = data["numberOfUnits"]
+    if data.get("publicRemarks"):
+        updates["public_remarks"] = data["publicRemarks"]
+    if data.get("ownershipType"):
+        updates["ownership_type"] = data["ownershipType"]
+    if data.get("pricePerSqFeet"):
+        updates["price_per_sqft"] = data["pricePerSqFeet"]
+    if data.get("associationFee"):
+        updates["association_fee"] = data["associationFee"]
+    if data.get("taxAnnualAmount"):
+        updates["tax_annual"] = data["taxAnnualAmount"]
+    if data.get("bathroomsFull") is not None:
+        updates["bathrooms_full"] = data["bathroomsFull"]
+    if data.get("bathroomsHalf") is not None:
+        updates["bathrooms_half"] = data["bathroomsHalf"]
+    if data.get("bathroomsTotal") is not None:
+        updates["bathrooms_total"] = data["bathroomsTotal"]
+    if data.get("maintenanceExpense"):
+        updates["maintenance_expense"] = data["maintenanceExpense"]
+
+    # Agent info (API uses fullName, officeName, officePhone)
+    agents = data.get("agents", []) or []
+    if agents:
+        a = agents[0]
+        name = a.get("fullName") or a.get("name")
+        if name:
+            updates["listing_agent"] = name
+        if a.get("email"):
+            updates["listing_agent_email"] = a["email"]
+        phone = a.get("officePhone") or a.get("phone")
+        if phone:
+            updates["listing_agent_phone"] = phone
+        brokerage = a.get("officeName") or a.get("brokerageName")
+        if brokerage:
+            updates["listing_brokerage"] = brokerage
+    buyer_agents = data.get("buyerAgents", []) or []
+    if buyer_agents:
+        ba = buyer_agents[0]
+        bname = ba.get("fullName") or ba.get("name")
+        if bname:
+            updates["buyer_agent"] = bname
+        bbrokerage = ba.get("officeName") or ba.get("brokerageName")
+        if bbrokerage:
+            updates["buyer_brokerage"] = bbrokerage
+    if data.get("buyerSideCommission"):
+        updates["commission"] = data["buyerSideCommission"]
+
+    # Transport scores (nested: {"walkScore": {"score": 100, ...}, ...})
+    transport = data.get("transportation", {}) or {}
+    ws = transport.get("walkScore")
+    if isinstance(ws, dict) and ws.get("score") is not None:
+        updates["walk_score"] = ws["score"]
+    ts = transport.get("transitScore")
+    if isinstance(ts, dict) and ts.get("score") is not None:
+        updates["transit_score"] = ts["score"]
+    bs = transport.get("bikeScore")
+    if isinstance(bs, dict) and bs.get("score") is not None:
+        updates["bike_score"] = bs["score"]
+
+    # Features
+    features = data.get("features", []) or []
+    if features:
+        updates["features"] = json.dumps(features)
+
+    # Images (first 10)
+    images = data.get("images", []) or []
+    if images:
+        updates["images"] = json.dumps([img.get("url") for img in images[:10]])
+
+    return updates
+
+
+def _detail_worker(cid):
+    """Fetch detail for a single listing. Returns (cid, updates) or (cid, None)."""
+    data = api_get("/listing/details", params={"coreListingId": cid}, label=f"detail")
+    if not data:
+        return (cid, None)
+    return (cid, _extract_detail_updates(data))
+
+
+DETAIL_WORKERS = 8  # concurrent detail fetchers
+
+
 def fetch_details(conn, limit=None):
     query = "SELECT core_listing_id FROM listings WHERE detail_fetched = 0"
     if limit:
@@ -697,63 +894,35 @@ def fetch_details(conn, limit=None):
         tprint("No listings need detail fetching.")
         return 0
 
-    tprint(f"\nFetching details for {len(ids)} listings...")
+    tprint(f"\nFetching details for {len(ids)} listings ({DETAIL_WORKERS} workers)...")
     fetched = 0
+    failed = 0
 
-    for i, cid in enumerate(ids):
-        data = api_get("/listing/details", params={"coreListingId": cid},
-                       label=f"detail {i+1}/{len(ids)}")
-        if not data:
-            continue
+    with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as executor:
+        futures = {executor.submit(_detail_worker, cid): cid for cid in ids}
+        for i, future in enumerate(as_completed(futures)):
+            cid, updates = future.result()
+            if updates:
+                set_clause = ", ".join([f"{k}=?" for k in updates.keys()])
+                conn.execute(
+                    f"UPDATE listings SET {set_clause} WHERE core_listing_id=?",
+                    list(updates.values()) + [cid]
+                )
+                fetched += 1
+            else:
+                # Mark as attempted so we don't retry forever
+                conn.execute(
+                    "UPDATE listings SET detail_fetched = -1 WHERE core_listing_id=?",
+                    [cid]
+                )
+                failed += 1
 
-        updates = {"detail_fetched": 1}
-        addr = data.get("address", {}) or {}
-        if addr.get("neighborhood"):
-            updates["neighborhood"] = addr["neighborhood"]
-        if addr.get("postalCode"):
-            updates["zip"] = addr["postalCode"]
-        lat = (data.get("latLng") or {}).get("lat")
-        lng = (data.get("latLng") or {}).get("lng")
-        if lat:
-            updates["latitude"] = lat
-        if lng:
-            updates["longitude"] = lng
-        if data.get("yearBuilt"):
-            updates["year_built"] = data["yearBuilt"]
-        if data.get("buildingName"):
-            updates["building_name"] = data["buildingName"]
-        if data.get("stories"):
-            updates["stories"] = data["stories"]
-        if data.get("numberOfUnits"):
-            updates["num_units"] = data["numberOfUnits"]
-        if data.get("publicRemarks"):
-            updates["public_remarks"] = data["publicRemarks"]
-        if data.get("ownershipType"):
-            updates["ownership_type"] = data["ownershipType"]
-        if data.get("pricePerSqFeet"):
-            updates["price_per_sqft"] = data["pricePerSqFeet"]
-        if data.get("associationFee"):
-            updates["association_fee"] = data["associationFee"]
-        if data.get("taxAnnualAmount"):
-            updates["tax_annual"] = data["taxAnnualAmount"]
+            if (i + 1) % 500 == 0:
+                conn.commit()
+                tprint(f"  Details: {i+1}/{len(ids)} (ok={fetched}, fail={failed})")
 
-        images = data.get("images", []) or []
-        if images:
-            updates["images"] = json.dumps([img.get("url") for img in images[:10]])
-
-        set_clause = ", ".join([f"{k}=?" for k in updates.keys()])
-        conn.execute(
-            f"UPDATE listings SET {set_clause} WHERE core_listing_id=?",
-            list(updates.values()) + [cid]
-        )
-        conn.commit()
-        fetched += 1
-
-        if (i + 1) % 100 == 0:
-            tprint(f"  Details: {i+1}/{len(ids)}")
-        time.sleep(DELAY)
-
-    tprint(f"  Details fetched: {fetched}/{len(ids)}")
+    conn.commit()
+    tprint(f"  Details fetched: {fetched}/{len(ids)} ({failed} failed)")
     return fetched
 
 

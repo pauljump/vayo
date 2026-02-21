@@ -1,8 +1,8 @@
 # vayo - Current State
 
-**Last updated:** 2026-02-19
-**Sessions:** ~12+
-**Readiness:** 50%
+**Last updated:** 2026-02-21
+**Sessions:** ~14+
+**Readiness:** 60%
 
 ## Goal
 Build a "Zillow meets Bloomberg Terminal" apartment finder that uses public data transparency to surface hidden gems and predict availability before listings go live.
@@ -12,137 +12,111 @@ Build a "Zillow meets Bloomberg Terminal" apartment finder that uses public data
 ```
 Brokerage APIs (Elliman, Corcoran)     StreetEasy (Wayback + Direct)     ACRIS (NYC Public)
          ↓                                        ↓                           ↓
-   elliman_mls.db                           se_listings.db               vayo_clean.db
-   corcoran.db                                                          (8.4 GB, 49M records)
+   elliman_mls.db (291K)                   se_listings.db               vayo_clean.db
+   corcoran.db (838K)                                                  (8.4 GB, 49M records)
          ↓                                        ↓                           ↓
          └──────────────────────┬──────────────────┘                          │
                                 ↓                                             │
-                    Unified Listings DB  ←────────────────────────────────────┘
-                    (address/BBL matching)
+                 listings_unified.db (15 GB)  ←───────────────────────────────┘
+                 1.13M listings, 79.8M price events
+                 99.9% address→BBL match rate
                                 ↓
                     Web Dashboard + Analytics
 ```
 
+## Unified Listings Database — `listings_unified.db` (15 GB)
+
+**Built 2026-02-21** via `scripts/unify_listings.py`
+
+### Contents
+- **1,128,683 listings** (Elliman 291K + Corcoran 838K)
+  - Sales: 546K | Rentals: 583K
+  - Closed: 1.08M | Active: 20.5K | Pending: 10.9K | Expired: 15.5K
+- **79,784,091 price history events**
+  - Corcoran building histories: 77.2M (full transaction timelines, decades deep)
+  - Corcoran listing events: 1.6M
+  - StreetEasy Wayback: 686K
+  - Elliman: 266K
+- **106,992 distinct BBLs** linked to PLUTO
+
+### Coverage
+- Manhattan: 82% of all BBLs (26.5K / 32.5K)
+- Multi-unit residential (C/D/R) NYC-wide: 67% (107K / 161K)
+- Brooklyn: 21% | Queens: 8% | Bronx: 4% | SI: 2%
+
+### Field completeness
+- BBL/address/borough/zip: 99.8-100%
+- Bedrooms/bathrooms: 99%
+- Close price: 93.5% | List price: 99.8%
+- Lat/lon: 95% | Sqft: 65% | Year built: 85.5%
+
+### Data quality issues to fix
+- Date formats inconsistent (Corcoran M/D/YYYY vs Elliman ISO)
+- Junk dates exist (1900, 2121, 0001, etc.)
+- Dedup found 0 cross-source matches (date format mismatch likely cause)
+
+### How to rebuild
+```bash
+python3 scripts/unify_listings.py                    # full pipeline (address match → extract → dedup)
+python3 scripts/unify_listings.py --phase match      # just address matching (cached, fast on re-run)
+python3 scripts/unify_listings.py --phase elliman    # just elliman extract
+python3 scripts/unify_listings.py --phase corcoran   # just corcoran extract
+python3 scripts/unify_listings.py --phase streeteasy # just SE wayback extract
+python3 scripts/unify_listings.py --phase dedup      # just dedup
+python3 scripts/unify_listings.py --status           # show counts
+```
+
 ## Brokerage API Pullers
 
-### Elliman MLS — `scripts/pull_elliman_mls.py` → `elliman_mls.db`
+### Elliman MLS — COMPLETE
+- `elliman_mls.db`: **291,100 listings** (full NYC)
+- API: `core.api.elliman.com`, obfuscated timestamp auth
+- 300-cap partitioning by neighborhood → bedroom → price
 
-**API:** `core.api.elliman.com` (Trestle/CoreLogic REBNY feed, no API key)
-**Auth:** Obfuscated timestamp header (base64 + char shift)
-
-**Methodology (validated 2026-02-19):**
-- API returns max ~300 unique results per query, then recycles
-- Partition: query → if 300 (capped) → split by bedroom → split by price → recurse
-- Under 300 = complete for that bucket
-- Statuses: Closed, Active, ActiveUnderContract, Pending
-- Types: ResidentialLease, ResidentialSale
-- Partitioned by borough, checkpointed at every level
-
-**Current data:** Gramercy proof-of-concept (4,895 listings)
-**Target:** All NYC (~unknown total, need to discover)
-
-**Usage:**
-```bash
-python3 scripts/pull_elliman_mls.py                    # all NYC
-python3 scripts/pull_elliman_mls.py --manhattan-only   # Manhattan only
-python3 scripts/pull_elliman_mls.py --status           # show progress
-```
-
-### Corcoran — `scripts/pull_corcoran.py` → `corcoran.db`
-
-**API:** `backendapi.corcoranlabs.com` (Realogy/Anywhere "NewTaxi" backend)
-**Auth:** `be-api-key: 667256B5BF6ABFF6C8BDC68E88226` (hardcoded in their JS)
-
-**Methodology:**
-- Standard REST pagination (100/page, deterministic price+asc sort)
-- Search by listingStatus: Active, Sold, Rented, Expired
-- Search by transactionType: for-rent, for-sale
-- Borough-level partitioning via `citiesOrBoroughs` filter
-- Detail endpoint (`/api/listings/{id}`) returns 138 fields including:
-  - `listingHistories`: full building transaction history (sold prices, dates, sqft)
-  - `building`: 40-key dict (floors, units, year built, amenities)
-  - `closeSubways`: nearby transit with distances
-- All raw JSON preserved in `detail_json` column
-- Concurrent detail fetching (4 workers default, configurable)
-
-**NYC totals:**
-- Active: 4,086
-- Sold: 319,493
-- Rented: 356,733
-- Expired: 17,348
-- **Total: 697,660**
-
-**Current data:** Gramercy complete (12,826 listings + details in progress)
-**Target:** All NYC (697K search + details)
-
-**Usage:**
-```bash
-python3 scripts/pull_corcoran.py                       # all NYC
-python3 scripts/pull_corcoran.py --manhattan-only      # Manhattan only
-python3 scripts/pull_corcoran.py --details-only        # just fetch details
-python3 scripts/pull_corcoran.py --details-workers 8   # faster detail fetch
-python3 scripts/pull_corcoran.py --status              # show progress
-```
-
-### Other Brokerages Investigated
-
-| Brokerage | API? | Worth building? |
-|-----------|------|-----------------|
-| Compass | Partial (similarhomes API, Googlebot SSR) | Yes, later — 25-40K NYC exclusive rentals via sitemap |
-| C21/CB/BHGRE/ERA | Shared API, key in JS | No — ~80 NYC rentals total |
-| Brown Harris Stevens | Cloudflare-locked | No direct API access |
-| Nest Seekers | GraphQL schema exposed | Listings need auth |
-| Sotheby's | AWS WAF locked | No access |
+### Corcoran — COMPLETE
+- `corcoran.db`: **837,583 listings** (36 GB with detail JSON)
+- API: `backendapi.corcoranlabs.com`, key `667256B5BF6ABFF6C8BDC68E88226`
+- 50K-cap price splitting, detail endpoint with building histories
 
 ## StreetEasy Scraping
 
-### Wayback Machine Pipeline — `scripts/streeteasy_wayback_history.py`
-- 3-phase: CDX index → queue → fetch
-- ~190K of 944K buildings covered by Wayback
-- Overnight loop: `scripts/run_wayback_overnight.sh`
+### Wayback Machine — COMPLETE
+- 46,627 buildings with price history data
+- 1.3M raw events in `se_listings.db`
 
-### Direct Scraper — `scripts/se_fast_scrape.py`
-- tls-client with Chrome cookies, bypasses PerimeterX
-- Progress: 7,304 / 943,790 buildings (~0.8%)
-- VPS + residential proxy planned for full scrape
+### Direct Scraper — ON HOLD
+- `scripts/se_fast_scrape.py` — tls-client + Chrome cookies
+- 7,304 / 943,790 buildings scraped (~0.8%)
+- Manhattan target file ready: `se_sitemaps/manhattan_buildings.txt` (40,743 buildings)
+- **Plan**: VPS + residential proxy (IPRoyal ~$1.75/GB), ~$200-360 budget
+- Need: auto cookie refresh or proxy-based auth bypass
 
 ## ACRIS (NYC Public Records)
 - Master: 16.9M documents (done)
 - Legals: ~14.7M (done)
 - Parties: ~70% done
-- `scripts/pull_acris_partitioned.py --parties-only`
 
 ## What to Resume
 
-### Priority 1: Brokerage Full Pulls
-```bash
-# Corcoran — full NYC (search ~26min, details ~10hrs with 4 workers)
-python3 scripts/pull_corcoran.py
-
-# Elliman — full NYC (slower due to 300-cap splitting)
-python3 scripts/pull_elliman_mls.py
-```
-
-### Priority 2: StreetEasy Integration
-- Cross-reference brokerage data with SE listings
-- Build boutique brokerage catalog (tag small brokerages from SE)
-- Resume direct SE scraping for complete coverage
-
-### Priority 3: ACRIS Parties
-```bash
-python3 scripts/pull_acris_partitioned.py --parties-only
-```
+### Next Steps
+1. **StreetEasy Manhattan scrape** — VPS + proxy setup, 40.7K buildings ready
+2. **Date cleanup** — normalize formats, filter junk dates, re-run dedup
+3. **Web dashboard** — query the unified DB
+4. **ACRIS parties** — finish the remaining 30%
 
 ## Databases
-- `elliman_mls.db` — Elliman/REBNY MLS data
-- `corcoran.db` — Corcoran data (active + sold + rented + expired + details)
-- `vayo_clean.db` (8.4 GB) — Main DB, all tables keyed on BBL
-- `se_listings.db` — StreetEasy scraped data
+- `listings_unified.db` (15 GB) — **Unified listing + price history, main query target**
+- `elliman_mls.db` (686 MB) — Elliman source (read-only, don't modify)
+- `corcoran.db` (36 GB) — Corcoran source (read-only, don't modify)
+- `se_listings.db` (823 MB) — StreetEasy source (read-only for unify, written by scraper)
+- `vayo_clean.db` (8.4 GB) — PLUTO/ACRIS, all tables keyed on BBL
 
 ## Key Files
+- `scripts/unify_listings.py` — Builds listings_unified.db from all sources
 - `scripts/pull_elliman_mls.py` — Elliman MLS puller
-- `scripts/pull_corcoran.py` — Corcoran puller (NEW)
+- `scripts/pull_corcoran.py` — Corcoran puller
 - `scripts/se_fast_scrape.py` — StreetEasy direct scraper
 - `scripts/streeteasy_wayback_history.py` — Wayback pipeline
 - `scripts/pull_acris_partitioned.py` — ACRIS puller
 - `scripts/build_clean_db.py` — Builds vayo_clean.db
+- `se_sitemaps/manhattan_buildings.txt` — 40.7K Manhattan scrape targets

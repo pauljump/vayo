@@ -50,6 +50,8 @@ MAX_RETRIES = 6
 PAGE_SIZE = 100  # API supports up to 100
 DELAY = 0.15  # seconds between requests
 DETAIL_WORKERS = 4  # concurrent detail fetch workers
+MAX_SAFE_RESULTS = 45000  # API hard-caps at 50K (500 pages × 100), leave margin
+MAX_PRICE = 999_999_999  # upper bound for price splitting
 
 # Borough names for partitioning
 BOROUGHS = ["Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"]
@@ -335,7 +337,7 @@ def upsert_listings(conn, listings):
 
 def build_search_body(transaction_type=None, page=1, page_size=PAGE_SIZE,
                       neighborhoods=None, boroughs=None,
-                      listing_status=None):
+                      listing_status=None, price_min=None, price_max=None):
     """Build search request body."""
     body = {
         "page": page,
@@ -352,11 +354,16 @@ def build_search_body(transaction_type=None, page=1, page_size=PAGE_SIZE,
         body["neighborhoods"] = neighborhoods
     if boroughs:
         body["citiesOrBoroughs"] = boroughs
+    if price_min is not None:
+        body["priceMin"] = price_min
+    if price_max is not None:
+        body["priceMax"] = price_max
     return body
 
 
 def paginate_search(conn, label, transaction_type=None, listing_status=None,
-                    neighborhoods=None, boroughs=None, query_type=None):
+                    neighborhoods=None, boroughs=None, query_type=None,
+                    price_min=None, price_max=None):
     """Paginate through all search results. Returns total fetched."""
 
     partition_key = label
@@ -366,7 +373,8 @@ def paginate_search(conn, label, transaction_type=None, listing_status=None,
 
     body = build_search_body(transaction_type=transaction_type,
                              listing_status=listing_status, page=1,
-                             neighborhoods=neighborhoods, boroughs=boroughs)
+                             neighborhoods=neighborhoods, boroughs=boroughs,
+                             price_min=price_min, price_max=price_max)
     data = api_post("/api/search/listings", body, label=f"{label}/p1")
     if not data:
         tprint(f"  [{label}] ERROR: no response from API")
@@ -394,7 +402,8 @@ def paginate_search(conn, label, transaction_type=None, listing_status=None,
     for page in range(2, total_pages + 1):
         body = build_search_body(transaction_type=transaction_type,
                                  listing_status=listing_status, page=page,
-                                 neighborhoods=neighborhoods, boroughs=boroughs)
+                                 neighborhoods=neighborhoods, boroughs=boroughs,
+                                 price_min=price_min, price_max=price_max)
         data = api_post("/api/search/listings", body,
                         label=f"{label}/p{page}")
         if not data:
@@ -513,10 +522,63 @@ def fetch_details(conn, limit=None, workers=DETAIL_WORKERS):
 
 # ── Main Pull Orchestration ─────────────────────────────────
 
+def pull_partition(conn, category_label, transaction_type, listing_status,
+                   borough, price_min=0, price_max=MAX_PRICE, query_type=None):
+    """Pull a single borough partition with automatic price-range splitting
+    when results exceed the API's 50K cap."""
+
+    qt = query_type or category_label
+    if price_min > 0 or price_max < MAX_PRICE:
+        label = f"{category_label}/{borough}/${price_min}-{price_max}"
+    else:
+        label = f"{category_label}/{borough}"
+
+    if is_done(conn, qt, label):
+        tprint(f"  [{label}] SKIP (already completed)")
+        return 0
+
+    # Probe total count with a single-item request
+    body = build_search_body(transaction_type=transaction_type,
+                             listing_status=listing_status, page=1, page_size=1,
+                             boroughs=[borough],
+                             price_min=price_min if price_min > 0 else None,
+                             price_max=price_max if price_max < MAX_PRICE else None)
+    data = api_post("/api/search/listings", body, label=f"{label}/probe")
+    if not data:
+        return 0
+
+    total = data.get("totalItems", 0)
+
+    if total > MAX_SAFE_RESULTS:
+        mid = (price_min + price_max) // 2
+        if mid <= price_min:
+            tprint(f"  [{label}] {total:,} items at min range — paginating anyway (may lose tail)")
+        else:
+            tprint(f"  [{label}] {total:,} items > {MAX_SAFE_RESULTS:,} cap, "
+                   f"splitting ${price_min:,}-${mid:,} / ${mid:,}-${price_max:,}")
+            c1 = pull_partition(conn, category_label, transaction_type,
+                                listing_status, borough, price_min, mid, qt)
+            c2 = pull_partition(conn, category_label, transaction_type,
+                                listing_status, borough, mid, price_max, qt)
+            return c1 + c2
+
+    # Safe to paginate
+    return paginate_search(
+        conn, label,
+        transaction_type=transaction_type,
+        listing_status=listing_status,
+        boroughs=[borough],
+        query_type=qt,
+        price_min=price_min if price_min > 0 else None,
+        price_max=price_max if price_max < MAX_PRICE else None,
+    )
+
+
 def pull_category(conn, category_label, transaction_type=None,
                   listing_status=None, neighborhoods=None,
                   borough_filter=None):
-    """Pull all listings for a category, partitioned by borough."""
+    """Pull all listings for a category, partitioned by borough.
+    Auto-splits by price range when a partition exceeds the API's 50K cap."""
     tprint(f"\n{'='*60}")
     tprint(f"  {category_label}")
     tprint(f"{'='*60}")
@@ -535,15 +597,14 @@ def pull_category(conn, category_label, transaction_type=None,
         )
         grand_total += total
     else:
-        # Borough-partitioned pull for checkpoint/resume
+        # Borough-partitioned pull with automatic price splitting
         boroughs = [borough_filter] if borough_filter else BOROUGHS
         for borough in boroughs:
-            borough_label = f"{category_label}/{borough}"
-            total = paginate_search(
-                conn, borough_label,
+            total = pull_partition(
+                conn, category_label,
                 transaction_type=transaction_type,
                 listing_status=listing_status,
-                boroughs=[borough],
+                borough=borough,
                 query_type=category_label,
             )
             grand_total += total
