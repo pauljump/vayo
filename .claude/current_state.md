@@ -99,19 +99,22 @@ python3 scripts/unify_listings.py --status           # show counts
 ## What to Resume
 
 ### Next Steps
-1. **StreetEasy Manhattan scrape** — VPS + proxy setup, 40.7K buildings ready
-2. **Date cleanup** — normalize formats, filter junk dates, re-run dedup
-3. **Web dashboard** — query the unified DB
-4. **ACRIS parties** — finish the remaining 30%
+1. **Add more landlord APIs** — Nest Seekers GraphQL, RentCafe/Yardi, Compass similarhomes
+2. **StreetEasy Manhattan scrape** — VPS + proxy setup, 40.7K buildings ready
+3. **Date cleanup** — normalize formats, filter junk dates, re-run dedup
+4. **Web dashboard** — query the unified DB + pullers.db
+5. **ACRIS parties** — finish the remaining 30%
 
 ## Databases
 - `listings_unified.db` (15 GB) — **Unified listing + price history, main query target**
+- `pullers.db` — **Live apartment puller DB** (302 active listings, 3 sources)
 - `elliman_mls.db` (686 MB) — Elliman source (read-only, don't modify)
 - `corcoran.db` (36 GB) — Corcoran source (read-only, don't modify)
 - `se_listings.db` (823 MB) — StreetEasy source (read-only for unify, written by scraper)
 - `vayo_clean.db` (8.4 GB) — PLUTO/ACRIS, all tables keyed on BBL
 
 ## Key Files
+- `scripts/pull_unified.py` — **Unified puller** (StuyTown + Durst + Glenwood)
 - `scripts/unify_listings.py` — Builds listings_unified.db from all sources
 - `scripts/pull_elliman_mls.py` — Elliman MLS puller
 - `scripts/pull_corcoran.py` — Corcoran puller
@@ -120,3 +123,30 @@ python3 scripts/unify_listings.py --status           # show counts
 - `scripts/pull_acris_partitioned.py` — ACRIS puller
 - `scripts/build_clean_db.py` — Builds vayo_clean.db
 - `se_sitemaps/manhattan_buildings.txt` — 40.7K Manhattan scrape targets
+
+## Unified Puller — `scripts/pull_unified.py`
+
+**Built 2026-02-21** — Plugin architecture for pulling live apartment data.
+
+### Sources
+- **StuyTown** (Beam Living): JSON API at `units.stuytown.com/api/units`, no auth, 5 properties
+- **Durst**: MRI ProspectConnect HTML scraping with CSRF tokens, 7 buildings
+- **Glenwood**: WordPress HTML scraping, 26 buildings
+
+### Current Inventory (pullers.db)
+- 302 active listings (248 StuyTown + 24 Durst + 30 Glenwood)
+- Price history snapshots tracked daily
+- Active/inactive status tracking
+
+### Dead Ends
+- Nestio API: acquired by Funnel Leasing, key `976b776fd17b454f8cbb135deea308a1` defunct
+- Durst Airtable: marketing content only (press clips, POI data), no listings
+- 4 of 7 Durst buildings are waitlist-only (rent-stabilized, no market-rate availability)
+
+### How to run
+```bash
+python3 scripts/pull_unified.py                   # pull all sources
+python3 scripts/pull_unified.py --source stuytown  # pull one source
+python3 scripts/pull_unified.py --status           # show counts
+python3 scripts/pull_unified.py --reset stuytown   # clear + re-pull
+```
